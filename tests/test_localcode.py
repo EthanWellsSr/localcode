@@ -179,7 +179,13 @@ lc.main()
                 wait_for("\x1b[?1049l")
                 process.wait(timeout=5)
                 self.assertEqual(process.returncode, 0)
-                self.assertEqual(termios.tcgetattr(slave), original)
+                restored = termios.tcgetattr(slave)
+                # Darwin may set PENDIN when canonical input is restored; this
+                # kernel-managed flag schedules pending input for reprinting.
+                pending_input = getattr(termios, "PENDIN", 0)
+                restored[3] &= ~pending_input
+                original[3] &= ~pending_input
+                self.assertEqual(restored, original)
                 self.assertNotIn(b"Traceback", output)
                 history = json.loads((Path(directory) / "localcode/history.jsonl").read_text().splitlines()[0])
                 self.assertEqual(history, "项目\nhello")

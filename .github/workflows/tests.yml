@@ -5,9 +5,10 @@ on:
 jobs:
   test:
     strategy:
+      fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-22.04
             python: '3.9'
           - os: ubuntu-latest
             python: '3.12'
