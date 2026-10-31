@@ -42,7 +42,7 @@ Writes, edits and shell commands show a diff or the command and ask before runni
 
 | Env var | Default |
 | --- | --- |
-| `LOCALCODE_MODEL` | `qwen2.5-coder:14b` |
+| `LOCALCODE_MODEL` | `gpt-oss:20b` |
 | `LOCALCODE_NUM_CTX` | `32768` |
 | `OLLAMA_HOST` | `http://localhost:11434` |
 
@@ -52,4 +52,4 @@ On startup, localcode looks for `AGENTS.md` (any capitalization) in the project 
 
 Some models print tool calls as text instead of returning them as structured calls (qwen2.5-coder writes bare JSON; qwen3-coder writes `<function=...>` XML). localcode parses both formats.
 
-On a 24 GB Mac, `qwen3-coder:30b` with a 32k context doesn't fully fit on the GPU and runs slowly; the 14b model fits comfortably.
+The default is `gpt-oss:20b` (`ollama pull gpt-oss:20b`). It's a mixture-of-experts model that uses about 3.6B parameters per token, so on a 24 GB M-series MacBook Air it runs fully on the GPU at a 32k context (12 GB) and generates at about 18 tok/s, roughly twice as fast as the dense `qwen2.5-coder:14b`. `qwen3-coder:30b` doesn't fully fit on the GPU on that machine and runs slowly.

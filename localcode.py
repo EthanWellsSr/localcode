@@ -27,7 +27,7 @@ from pathlib import Path
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
 if not OLLAMA_HOST.startswith("http"):
     OLLAMA_HOST = "http://" + OLLAMA_HOST
-DEFAULT_MODEL = os.environ.get("LOCALCODE_MODEL", "qwen2.5-coder:14b")
+DEFAULT_MODEL = os.environ.get("LOCALCODE_MODEL", "gpt-oss:20b")
 NUM_CTX = int(os.environ.get("LOCALCODE_NUM_CTX", "32768"))
 MAX_STEPS = 40
 MAX_TOOL_OUTPUT = 24000
