@@ -36,7 +36,7 @@ Writes, edits and shell commands show a diff or the command and ask before runni
 
 ## Output
 
-localcode takes over the terminal window: the header sits centered at the top, the conversation scrolls in the middle, and the input box stays pinned to the bottom with a status line under it showing the model, the folder, how much of the context window is used, and the last reply's speed. Reasoning models' thinking is collapsed to a single "✻ Thought for Ns" line (set `LOCALCODE_SHOW_THINKING=1` to see it). When you quit, localcode clears the window and hands it back.
+localcode runs full-window on the terminal's alternate screen, like `vim` or `htop`: your earlier terminal output is out of view while it runs and comes back unchanged when you quit. The LOCALCODE banner stays pinned at the top, the conversation scrolls in the middle, and the input box stays pinned to the bottom with a status line under it showing the model, the folder, how much of the context window is used, and the last reply's speed. Scroll back through the conversation with the mouse wheel, PgUp/PgDn or Shift+↑/↓. Because the mouse wheel is handled by localcode, selecting text with the mouse needs your terminal's override key held while dragging (Fn in Terminal.app, Option in iTerm2). Reasoning models' thinking is collapsed to a single "✻ Thought for Ns" line (set `LOCALCODE_SHOW_THINKING=1` to see it).
 
 Replies are rendered as Markdown while they stream: headings and **bold** in bold, `code` in color, bullets as •, code blocks with a side bar, and tables drawn as aligned boxes that fit the terminal width. When output is piped instead of shown in a terminal, the raw Markdown is passed through.
 
@@ -54,6 +54,7 @@ Type `/` and a menu of commands appears under the input: ↑/↓ to choose, Tab 
 
 | Key | |
 | --- | --- |
+| Mouse wheel, PgUp/PgDn, Shift+↑/↓ | Scroll back through the conversation |
 | ↑/↓ | Step through past entries (saved across sessions in `~/.config/localcode/history.jsonl`) |
 | `\` then Enter | Start a new line; pasting multi-line text also works |
 | Ctrl-C | Clear the line; on an empty line, quit |

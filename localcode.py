@@ -67,6 +67,11 @@ def prompt(text):
     return re.sub(r"(\033\[[0-9;]*m)", "\001\\1\002", text)
 
 
+def term_out():
+    """The real terminal stream, bypassing the full-window conversation recorder when it's installed."""
+    return getattr(sys.stdout, "raw", sys.stdout)
+
+
 class Spinner:
     """Shows 'waiting for model… Ns' until stop() is called, so a slow model load doesn't look like a hang."""
 
@@ -85,11 +90,13 @@ class Spinner:
         i = 0
         while not self.done.wait(0.1):
             elapsed = int(time.monotonic() - start)
-            sys.stdout.write("\r" + dim(f"{self.FRAMES[i % len(self.FRAMES)]} {self.label}… {elapsed}s"))
-            sys.stdout.flush()
+            out = term_out()
+            out.write("\r" + dim(f"{self.FRAMES[i % len(self.FRAMES)]} {self.label}… {elapsed}s"))
+            out.flush()
             i += 1
-        sys.stdout.write("\r\033[K")
-        sys.stdout.flush()
+        out = term_out()
+        out.write("\r\033[K")
+        out.flush()
 
     def stop(self):
         if self.thread and not self.done.is_set():
@@ -404,9 +411,12 @@ class Tools:
             return True
         print(yellow(f"  allow {tool}? ") + summary)
         try:
-            ans = input(prompt(yellow("  [y]es / [n]o / [a]lways: "))).strip().lower()
+            question = yellow("  [y]es / [n]o / [a]lways: ")
+            ask = getattr(sys.stdout, "ask", None)  # full-window mode records the prompt and answer
+            ans = ask(question) if ask else input(prompt(question))
         except EOFError:
             return False
+        ans = ans.strip().lower()
         if ans:
             drop_last_history()  # keep y/n answers out of the up-arrow history
         if ans in ("a", "always"):
@@ -877,7 +887,7 @@ def pick(rows, start=0, title=""):
     fd = sys.stdin.fileno()
     saved = termios.tcgetattr(fd)
     sel = start if 0 <= start < len(rows) else 0
-    out = sys.stdout
+    out = term_out()
 
     def draw(first=False):
         if not first:
@@ -886,7 +896,7 @@ def pick(rows, start=0, title=""):
             out.write("\r\033[K" + (cyan(f"❯ {r}") if i == sel else f"  {r}") + "\n")
         out.flush()
 
-    print(dim(title))
+    out.write(dim(title) + "\n")
     out.write("\033[?25l")
     result = None
     try:
@@ -1021,14 +1031,99 @@ def short_path(p):
     return "~" + p[len(home):] if p == home or p.startswith(home + os.sep) else p
 
 
-ICON = ["▛▀▀▀▀▀▜", "▌ >_  ▐", "▙▄▄▄▄▄▟"]
+BIG = {  # 3-row block letters for the banner
+    "L": ["█   ", "█   ", "▀▀▀▀"], "O": ["█▀▀█", "█  █", "▀▀▀▀"], "C": ["█▀▀▀", "█   ", "▀▀▀▀"],
+    "A": ["█▀▀█", "█▀▀█", "▀  ▀"], "D": ["█▀▀▄", "█  █", "▀▀▀ "], "E": ["█▀▀▀", "█▀▀ ", "▀▀▀▀"],
+}
 PLACEHOLDER = "Ask anything, or type / for commands"
 EDITOR_HISTORY_PATH = STATE_PATH.parent / "history.jsonl"
 
 
-def header_lines(agent):
-    info = [bold("localcode"), dim(f"{agent.model} · Ollama"), dim(short_path(agent.tools.root))]
-    return [cyan(icon) + "   " + text for icon, text in zip(ICON, info)]
+def header_lines(agent, width, height):
+    """The pinned banner: big LOCALCODE lettering when there's room, else a single line."""
+    info = dim(f"{agent.model} · Ollama · {short_path(agent.tools.root)}")
+    if width >= 50 and height >= 24:
+        big = [cyan(" ".join(BIG[ch][r] for ch in "LOCALCODE")) for r in range(3)]
+        return ["", *big, "", info, instructions_status(agent.instructions), ""]
+    return [bold("localcode") + "  " + info, ""]
+
+
+def hard_wrap(line, width):
+    """Split a line (with color codes) into terminal rows exactly as the terminal would wrap it."""
+    rows, row, vis, active = [], "", 0, ""
+    for tok in re.findall(r"\x1b\[[0-9;]*m|.", line):
+        if tok.startswith("\x1b"):
+            row += tok
+            active = "" if tok in ("\x1b[0m", "\x1b[m") else active + tok
+            continue
+        if vis == width:
+            rows.append(row + "\x1b[0m")
+            row, vis = active, 0
+        row += tok
+        vis += 1
+    rows.append(row)
+    return rows
+
+
+class Transcript:
+    """Stands in for sys.stdout in full-window mode: passes output through and keeps a copy of the
+    conversation as lines, so it can be redrawn after resizes and scrolled back through."""
+
+    MAX_LINES = 5000
+    TOKEN = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\r\n|\n|\r|\x1b|[^\x1b\r\n]+")
+
+    def __init__(self, raw):
+        self.raw = raw
+        self.lines, self.cur = [], ""
+
+    def write(self, s):
+        self.raw.write(s)
+        for tok in self.TOKEN.findall(s):
+            if tok in ("\n", "\r\n"):
+                self._newline()
+            elif tok == "\r":
+                self.cur = ""  # a carriage return means the line is about to be overwritten
+            elif tok.startswith("\x1b["):
+                if tok.endswith("m"):
+                    self.cur += tok  # keep colors; other cursor/erase codes aren't part of the text
+            elif tok != "\x1b":
+                self.cur += tok
+        return len(s)
+
+    def _newline(self):
+        self.lines.append(self.cur)
+        self.cur = ""
+        if len(self.lines) > self.MAX_LINES:
+            del self.lines[:len(self.lines) - self.MAX_LINES]
+
+    def ask(self, question):
+        """A y/n style prompt inside the conversation: mouse reporting off so wheel scrolls don't type garbage."""
+        self.raw.write("\033[?1000l")
+        self.write(question)
+        self.flush()
+        try:
+            answer = sys.stdin.readline()
+            if not answer:
+                raise EOFError
+        finally:
+            self.raw.write("\033[?1000h")
+        answer = answer.rstrip("\n")
+        self.cur += answer  # the terminal echoed it; keep the copy in step
+        self._newline()
+        return answer
+
+    def clear(self):
+        self.lines, self.cur = [], ""
+
+    def flush(self):
+        self.raw.flush()
+
+    def isatty(self):
+        return self.raw.isatty()
+
+    @property
+    def encoding(self):
+        return self.raw.encoding
 
 
 def load_editor_history():
@@ -1047,11 +1142,13 @@ def load_editor_history():
 
 
 class Screen:
-    """Full-window layout: the conversation scrolls above, the input box and status stay pinned below.
+    """Full-window layout on the terminal's alternate screen, like vim or htop.
 
-    The transcript lives in a terminal scroll region (rows 1..bottom). Below it: a rule, the
-    prompt row, a rule, then two rows for the status and hint lines. While the / menu is open
-    those two rows show suggestions instead, and the box grows upward if it needs more room.
+    Rows 1..top hold the pinned banner. The conversation scrolls in a terminal scroll region
+    (top+1..bottom). Below it: a rule, the prompt row, a rule, then two rows for the status and
+    hint lines; while the / menu is open those rows show suggestions, and the box grows upward if
+    it needs more. Everything printed to the conversation is also kept (see Transcript), so it
+    can be redrawn on resize and scrolled back through with the mouse wheel or PgUp/PgDn.
     Input is read by a small raw-mode line editor (not readline) so the menu can update per key.
     Falls back to plain inline prompts when the output isn't a terminal or the window is too small.
     """
@@ -1065,7 +1162,8 @@ class Screen:
         self.active = False
         self.reading = False  # True while read_line() owns the prompt row
         self.extra = 0        # rows the box has grown upward for the menu
-        self.shift = 0        # rows the transcript scrolled up since its cursor position was saved
+        self.offset = 0       # how many rows the view is scrolled back from the newest output
+        self.gap = False      # print a blank line before the next echoed message
         self.history = []
         self.models = None    # installed model names, fetched when the /model menu first needs them
 
@@ -1076,69 +1174,93 @@ class Screen:
             return
         self.active = True
         self.history = load_editor_history()
+        self.raw = sys.stdout
+        self.rec = sys.stdout = Transcript(self.raw)
         atexit.register(self.stop)
         try:
             import signal
             signal.signal(signal.SIGWINCH, lambda *_: self.on_resize())
         except (ImportError, AttributeError, ValueError):
             pass
+        # Alternate screen (the earlier terminal output stays out of view and comes back on exit),
+        # plus mouse reporting so the wheel scrolls the conversation.
+        self._w("\033[?1049h\033[?1000h\033[?1006h")
         self.redraw_all()
 
     def _layout(self):
         size = shutil.get_terminal_size()
         self.w, self.h = size.columns, size.lines
+        self.header = header_lines(self.agent, self.w, self.h)
+        self.top = len(self.header)
         self.bottom = self.h - self.FRAME - self.extra
 
     def _w(self, s):
-        sys.stdout.write(s)
-        sys.stdout.flush()
+        self.raw.write(s)
+        self.raw.flush()
 
-    def _centered(self, lines):
-        pad = " " * max(0, (self.w - max(visible_len(l) for l in lines)) // 2)
-        for line in lines:
-            print(pad + line)
+    def draw_header(self):
+        self._layout()
+        out = "\0337"
+        for row, line in enumerate(self.header, 1):
+            pad = " " * max(0, (self.w - visible_len(line)) // 2)
+            out += f"\033[{row};1H\033[2K" + self.fit(pad + line)
+        self._w(out + "\0338")
 
     def redraw_all(self):
-        """Clear the window, then draw the header centered at the top and the input box at the bottom."""
-        self.extra = 0
+        """Redraw everything: banner, the conversation (from the kept copy) and the input box."""
         self._layout()
-        self._w("\033[2J" + f"\033[1;{self.bottom}r" + "\033[H")
-        print()
-        self._centered(header_lines(self.agent))
-        print()
-        self._centered([instructions_status(self.agent.instructions)])
-        print()
-        self.gap = False  # the header already ends with a blank line
+        self._w("\033[2J" + f"\033[{self.top + 1};{self.bottom}r")
+        self.draw_header()
+        self.render_view()
         self.draw_frame()
+
+    def clear_conversation(self):
+        self.rec.clear()
+        self.offset, self.gap = 0, False
+        self.redraw_all()
 
     def on_resize(self):
         if not self.active:
             return
-        self._layout()
+        self.redraw_all()
         if self.reading:
-            # The saved cursor slot holds the transcript position, so don't touch it; just redraw the box.
-            self._w(f"\033[1;{self.bottom}r")
             self.render()
-        else:
-            # Setting the scroll region homes the cursor, so keep the transcript position around it.
-            self._w("\0337" + f"\033[1;{self.bottom}r" + "\0338")
-            self.draw_frame()
 
     def grow(self, n):
-        """Make the box n rows taller than normal (for the menu), scrolling the transcript up to make room."""
-        n = max(0, min(n, self.h - self.FRAME - 3))
-        if n > self.extra:
-            d = n - self.extra
-            self._w(f"\033[{self.bottom};1H" + "\n" * d)
-            self.shift += d
-        elif n < self.extra:
-            for row in range(self.bottom + 1, self.bottom + 1 + self.extra - n):
-                self._w(f"\033[{row};1H\033[2K")
-        else:
+        """Make the box n rows taller than normal (for the menu); the conversation view shrinks to fit."""
+        n = max(0, min(n, self.h - self.FRAME - self.top - 3))
+        if n == self.extra:
             return
         self.extra = n
         self._layout()
-        self._w(f"\033[1;{self.bottom}r")
+        self._w(f"\033[{self.top + 1};{self.bottom}r")
+        self.render_view()
+
+    def render_view(self):
+        """Draw the conversation rows from the kept copy, scrolled back self.offset rows.
+
+        When showing the newest output (and not at the prompt), leaves the cursor where the
+        next output goes, so streaming continues exactly where the copy ends.
+        """
+        height = self.bottom - self.top
+        rows = []
+        for line in reversed(self.rec.lines + [self.rec.cur]):
+            rows[:0] = hard_wrap(line, self.w)
+            if len(rows) >= height + self.offset:
+                break
+        self.offset = max(0, min(self.offset, len(rows) - height))
+        end = len(rows) - self.offset
+        shown = rows[max(0, end - height):end]
+        out = ""
+        for k in range(height):
+            out += f"\033[{self.top + 1 + k};1H\033[2K" + (shown[k] + "\033[0m" if k < len(shown) else "")
+        if not self.reading and shown:
+            out += f"\033[{self.top + len(shown)};{min(self.w, visible_len(shown[-1]) + 1)}H"
+        self._w(out)
+
+    def scroll(self, rows):
+        self.offset = max(0, self.offset + rows)
+        self.render_view()
 
     def status_text(self):
         a = self.agent
@@ -1152,9 +1274,15 @@ class Screen:
         return dim("  " + "  |  ".join(parts))
 
     def hint_text(self):
+        if self.offset:
+            return "  " + cyan(f"↑ scrolled back {self.offset} lines") + dim(" · scroll down or PgDn to return")
         if self.agent.tools.auto_approve:
             return "  " + yellow("⏵⏵ auto-approve on") + dim(" (/yolo to turn off)")
-        return dim("  ? /help for commands · /model to switch models")
+        return dim("  ? /help for commands · /model to switch models · scroll or PgUp to look back")
+
+    def fit(self, line):
+        """Cut a line to the window width; a line that wraps would spill into the rows below it."""
+        return hard_wrap(line, self.w)[0] + "\033[0m"
 
     def draw_frame(self, save=True, below=None):
         """Draw the rules and the rows under the prompt (status + hint, or the menu rows passed in)."""
@@ -1163,7 +1291,7 @@ class Screen:
         below = below if below is not None else [self.status_text(), self.hint_text()]
         out = ("\0337" if save else "") + f"\033[{row};1H\033[2K" + rule + f"\033[{row + 2};1H\033[2K" + rule
         for i in range(2 + self.extra):
-            out += f"\033[{row + 3 + i};1H\033[2K" + (below[i] if i < len(below) else "")
+            out += f"\033[{row + 3 + i};1H\033[2K" + (self.fit(below[i]) if i < len(below) else "")
         self._w(out + ("\0338" if save else ""))
 
     # ---- the line editor
@@ -1228,8 +1356,7 @@ class Screen:
 
         self.buf, self.pos, self.sel, self.menu_closed, self.in_paste = [], 0, 0, False, False
         hist_i, draft = len(self.history), ""
-        self.shift = 0
-        self._w("\0337\033[?2004h")  # save the transcript cursor; turn on bracketed paste
+        self._w("\033[?2004h")  # bracketed paste, so multi-line pastes arrive as one piece
         self.reading = True
         termios.tcsetattr(fd, termios.TCSADRAIN, raw)
         result = None
@@ -1245,6 +1372,10 @@ class Screen:
                 i = 0
                 while i < len(data) and result is None:
                     key, i = self._next_key(data, i)
+                    if key in self.SCROLL_KEYS:
+                        self.scroll(self.SCROLL_KEYS[key] * (max(1, self.bottom - self.top - 2) if key.startswith("page") else 1))
+                        items = self.render()
+                        continue
                     result = self._handle_key(key, items)
                     if result is None:
                         if key in ("up", "down") and not items:
@@ -1253,10 +1384,11 @@ class Screen:
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, saved_tty)
             self.reading = False
+            self.offset = 0
             self.grow(0)
             self.draw_frame(save=False)
-            self._w(f"\033[{self.bottom + 2};1H\033[2K" + "\033[?2004l" + "\0338"
-                    + (f"\033[{self.shift}A" if self.shift else ""))
+            self._w(f"\033[{self.bottom + 2};1H\033[2K" + "\033[?2004l")
+            self.render_view()  # back to the newest output, cursor where the next output goes
         if isinstance(result, BaseException):
             raise result
         if result and (not self.history or self.history[-1] != result):
@@ -1294,7 +1426,11 @@ class Screen:
             seq = data[i + 2:j + 1]
             names = {"A": "up", "B": "down", "C": "right", "D": "left", "H": "home", "F": "end",
                      "1~": "home", "7~": "home", "4~": "end", "8~": "end", "3~": "delete",
-                     "1;3D": "wordleft", "1;5D": "wordleft", "1;3C": "wordright", "1;5C": "wordright"}
+                     "1;3D": "wordleft", "1;5D": "wordleft", "1;3C": "wordright", "1;5C": "wordright",
+                     "5~": "pageup", "6~": "pagedown", "1;2A": "lineup", "1;2B": "linedown"}
+            if seq.startswith("<"):  # SGR mouse report: 64/65 are wheel up/down, the rest is ignored
+                button = seq[1:].split(";")[0]
+                return {"64": "wheelup", "65": "wheeldown"}.get(button, "unknown"), j + 1
             return names.get(seq, "unknown"), j + 1
         alt = {"b": "wordleft", "f": "wordright", "\x7f": "wordback"}
         return alt.get(nxt, "unknown"), i + 2
@@ -1394,17 +1530,20 @@ class Screen:
         self.menu_closed = True  # a recalled "/command" shouldn't pop the menu open and take over ↑/↓
         return i, draft
 
+    SCROLL_KEYS = {"wheelup": 3, "wheeldown": -3, "lineup": 1, "linedown": -1, "pageup": 1, "pagedown": -1}
+
     def stop(self):
         if not self.active:
             return
         self.active = False
+        sys.stdout = self.raw
         try:
             EDITOR_HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
             EDITOR_HISTORY_PATH.write_text("".join(json.dumps(h) + "\n" for h in self.history[-HISTORY_LENGTH:]))
         except OSError:
             pass
-        # Give the window back clean: release the scroll region and clear what localcode drew.
-        self._w("\033[?2004l\033[r\033[2J\033[H")
+        # Mouse and paste modes off, scroll region released, and back to the screen from before.
+        self._w("\033[?1006l\033[?1000l\033[?2004l\033[r\033[?1049l")
 
 
 def main():
@@ -1465,7 +1604,7 @@ def main():
             elif cmd == "/clear":
                 agent.reset()
                 if screen.active:
-                    screen.redraw_all()
+                    screen.clear_conversation()
                 else:
                     print(dim("Conversation cleared. ") + instructions_status(agent.instructions))
             elif cmd in ("/model", "/models"):
@@ -1478,6 +1617,8 @@ def main():
                 if name and name != agent.model:
                     agent.model = name
                     save_state(model=name)
+                    if screen.active:
+                        screen.draw_header()
                     print(dim("Switched to ") + bold(name) + dim(". The conversation carries over; /clear to start fresh."))
                 else:
                     print(dim(f"Model: {agent.model}"))
