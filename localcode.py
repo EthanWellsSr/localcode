@@ -16,6 +16,7 @@ import fnmatch
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -91,6 +92,217 @@ class Spinner:
             self.thread.join()
 
 
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+BOLD, NOT_BOLD, CODE, NOT_CODE = "\033[1m", "\033[22m", "\033[36m", "\033[39m"
+
+
+def visible_len(s):
+    return len(ANSI_RE.sub("", s))
+
+
+def render_inline(s):
+    """**bold** and `code` for text we have in full (headings, table cells)."""
+    s = re.sub(r"\*\*(.+?)\*\*", BOLD + r"\1" + NOT_BOLD, s)
+    return re.sub(r"`([^`]+)`", CODE + r"\1" + NOT_CODE, s)
+
+
+def wrap_ansi(s, width):
+    """Word-wrap text that contains color codes, counting only visible characters."""
+    lines, line, vis, word, wvis = [], "", 0, "", 0
+    for tok in re.findall(r"\x1b\[[0-9;]*m|.", s) + [" "]:
+        if tok != " ":
+            word += tok
+            wvis += 0 if tok.startswith("\x1b") else 1
+            continue
+        if not word:
+            continue
+        if vis and vis + 1 + wvis > width:
+            lines.append(line)
+            line, vis = "", 0
+        line += (" " if vis else "") + word
+        vis += (1 if vis else 0) + wvis
+        word, wvis = "", 0
+    lines.append(line)
+    return lines
+
+
+class MarkdownStream:
+    """Renders streamed Markdown for the terminal, line by line.
+
+    Paragraphs, bullets and quotes stream as they arrive (with **bold** and `code` styled on the fly).
+    Headings, horizontal rules and fence lines wait for their newline; tables are held until the
+    table ends, then drawn as an aligned box that fits the terminal width.
+    """
+
+    def __init__(self):
+        self.width = shutil.get_terminal_size((100, 24)).columns
+        self.line = ""        # the current source line
+        self.mode = None      # how the current line is rendered, once we know
+        self.done = 0         # chars of self.line already rendered
+        self.in_code = False  # inside a ``` block
+        self.table = []
+        self.bold = self.code = False
+        self.star = False     # saw one '*', waiting to see if it's '**'
+        self.mid_line = False
+
+    def _w(self, s):
+        if s:
+            sys.stdout.write(s)
+            self.mid_line = not s.endswith("\n")
+
+    def feed(self, text):
+        if not USE_COLOR:  # piped output: leave the Markdown as-is
+            self._w(text)
+            sys.stdout.flush()
+            return
+        for ch in text:
+            if ch == "\n":
+                self._end_line()
+                continue
+            self.line += ch
+            if self.mode is None:
+                self._classify()
+            if self.mode in ("inline", "code"):
+                self._stream()
+        sys.stdout.flush()
+
+    def _classify(self):
+        """Decide how to render the current line, or return with mode None to wait for more text."""
+        s = self.line.lstrip()
+        indent = self.line[:len(self.line) - len(s)]
+        if not s:
+            return
+        if self.table and not s.startswith("|"):
+            self._flush_table()
+        if self.in_code:
+            if s.startswith("```"):
+                self.mode = "fence"
+            elif "```".startswith(s):
+                return
+            else:
+                self._w(dim("│ "))
+                self.mode = "code"
+            return
+        if s.startswith("|"):
+            self.mode = "table"
+        elif s.startswith("```"):
+            self.mode = "fence"
+        elif re.fullmatch(r"#{1,6}", s) or re.fullmatch(r"\d{1,3}[.)]?", s) or s in ("`", "``", ">") \
+                or re.fullmatch(r"([-*_+])\1*", s):
+            return  # could still become a heading, list item, fence, quote or rule
+        elif re.match(r"#{1,6} ", s):
+            self.mode = "heading"
+        elif m := re.match(r"[-*+] ", s):
+            self._w(indent + cyan("•") + " ")
+            self.mode, self.done = "inline", len(indent) + m.end()
+        elif m := re.match(r"\d{1,3}[.)] ", s):
+            self._w(indent + cyan(m.group(0)))
+            self.mode, self.done = "inline", len(indent) + m.end()
+        elif s.startswith(">"):
+            self._w(indent + dim("│ "))
+            self.mode, self.done = "inline", len(indent) + (2 if s.startswith("> ") else 1)
+        else:
+            self.mode = "inline"
+
+    def _stream(self):
+        rest = self.line[self.done:]
+        self.done = len(self.line)
+        if self.mode == "code":
+            self._w(rest)
+            return
+        for ch in rest:
+            if self.star:
+                self.star = False
+                if ch == "*":
+                    self.bold = not self.bold
+                    self._w(BOLD if self.bold else NOT_BOLD)
+                    continue
+                self._w("*")
+            if ch == "*":
+                self.star = True
+            elif ch == "`":
+                self.code = not self.code
+                self._w(CODE if self.code else NOT_CODE)
+            else:
+                self._w(ch)
+
+    def _end_line(self):
+        s = self.line.strip()
+        if self.mode is None and s:
+            self._classify()
+        if self.mode is None:
+            if not s:
+                if self.table:
+                    self._flush_table()
+                self._w("\n")
+            elif re.fullmatch(r"([-*_])\1{2,}", s):
+                self._w(dim("─" * min(self.width, 60)) + "\n")
+            else:  # a lone "#", "1." or similar: just show it
+                self.mode = "code" if self.in_code else "inline"
+                self._stream()
+        if self.mode == "heading":
+            level = len(s) - len(s.lstrip("#"))
+            text = render_inline(s[level:].strip().rstrip("#").strip())
+            self._w(("\033[1;4m" if level == 1 else BOLD) + text + "\033[0m\n")
+        elif self.mode == "fence":
+            self.in_code = not self.in_code
+        elif self.mode == "table":
+            self.table.append(s)
+        elif self.mode in ("inline", "code"):
+            if self.star:
+                self._w("*")
+            if self.bold or self.code:
+                self._w("\033[0m")
+            self._w("\n")
+        self.line, self.mode, self.done = "", None, 0
+        self.bold = self.code = self.star = False
+
+    def _flush_table(self):
+        rows, header = [], False
+        for raw in self.table:
+            cells = [c.strip() for c in raw.strip().strip("|").split("|")]
+            if all(re.fullmatch(r":?-{2,}:?", c) for c in cells if c) and any(cells):
+                header = len(rows) == 1
+                continue
+            rows.append([render_inline(c) for c in cells])
+        self.table = []
+        if not rows:
+            return
+        ncol = max(len(r) for r in rows)
+        rows = [r + [""] * (ncol - len(r)) for r in rows]
+        widths = [max(visible_len(r[i]) for r in rows) for i in range(ncol)]
+        avail = self.width - (3 * ncol + 1)
+        while sum(widths) > avail and max(widths) > 8:
+            widths[widths.index(max(widths))] -= 1
+
+        def border(left, mid, right):
+            return dim(left + mid.join("─" * (w + 2) for w in widths) + right) + "\n"
+
+        out = border("┌", "┬", "┐")
+        for n, row in enumerate(rows):
+            cells = [wrap_ansi(c, w) for c, w in zip(row, widths)]
+            for k in range(max(len(c) for c in cells)):
+                parts = []
+                for c, w in zip(cells, widths):
+                    text = c[k] if k < len(c) else ""
+                    if n == 0 and header:
+                        text = BOLD + text + NOT_BOLD
+                    parts.append(" " + text + "\033[0m" + " " * max(0, w - visible_len(text)) + " ")
+                out += dim("│") + dim("│").join(parts) + dim("│") + "\n"
+            if n == 0 and header and len(rows) > 1:
+                out += border("├", "┼", "┤")
+        self._w(out + border("└", "┴", "┘"))
+
+    def finish(self):
+        if not USE_COLOR:
+            return
+        if self.line or self.mode:
+            self._end_line()
+        if self.table:
+            self._flush_table()
+        sys.stdout.flush()
+
+
 class StreamPrinter:
     """Prints streamed model text, but holds back anything that might be a text-format tool call.
 
@@ -104,12 +316,15 @@ class StreamPrinter:
         self.text = ""
         self.printed = 0
         self.holding = False
-        self.needs_newline = False
+        self.md = MarkdownStream()
+
+    @property
+    def needs_newline(self):
+        return self.md.mid_line
 
     def _emit(self, s):
         if s:
-            print(s, end="", flush=True)
-            self.needs_newline = not s.endswith("\n")
+            self.md.feed(s)
 
     def _could_be_marker(self, line):
         line = line.lstrip()
@@ -145,6 +360,7 @@ class StreamPrinter:
         if show_held:
             self._emit(self.text[self.printed:])
         self.printed = len(self.text)
+        self.md.finish()
 
 
 def print_diff(old, new, path):

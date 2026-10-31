@@ -34,6 +34,10 @@ Long files are returned in pages with the exact `offset` to read next. Re-readin
 
 Writes, edits and shell commands show a diff or the command and ask before running: `[y]es / [n]o / [a]lways`. `--yolo` skips the prompts.
 
+## Output
+
+Replies are rendered as Markdown while they stream: headings and **bold** in bold, `code` in color, bullets as •, code blocks with a side bar, and tables drawn as aligned boxes that fit the terminal width. When output is piped instead of shown in a terminal, the raw Markdown is passed through.
+
 ## REPL commands
 
 | Command | |
