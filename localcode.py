@@ -50,6 +50,15 @@ def yellow(t): return c("33", t)
 def cyan(t): return c("36", t)
 
 
+def prompt(text):
+    """Wrap color codes in \\001/\\002 so readline doesn't count them as visible width.
+
+    Without this, readline thinks the prompt is wider than it is and backspace/redraw
+    lands in the wrong column, eating into earlier output.
+    """
+    return re.sub(r"(\033\[[0-9;]*m)", "\001\\1\002", text)
+
+
 class Spinner:
     """Shows 'waiting for model… Ns' until stop() is called, so a slow model load doesn't look like a hang."""
 
@@ -116,7 +125,7 @@ class Tools:
             return True
         print(yellow(f"  allow {tool}? ") + summary)
         try:
-            ans = input(yellow("  [y]es / [n]o / [a]lways: ")).strip().lower()
+            ans = input(prompt(yellow("  [y]es / [n]o / [a]lways: "))).strip().lower()
         except EOFError:
             return False
         if ans in ("a", "always"):
@@ -464,7 +473,7 @@ def list_models():
 def read_input():
     lines = []
     while True:
-        line = input(bold("> ") if not lines else "  ")
+        line = input(prompt(bold("> ")) if not lines else "  ")
         if line.endswith("\\"):
             lines.append(line[:-1])
             continue
