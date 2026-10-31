@@ -30,7 +30,7 @@ Writes, edits and shell commands show a diff or the command and ask before runni
 | `LOCALCODE_NUM_CTX` | `32768` |
 | `OLLAMA_HOST` | `http://localhost:11434` |
 
-If an `AGENTS.md` exists in the project, it's added to the system prompt.
+On startup, localcode looks for `AGENTS.md` (any capitalization) in the project and quietly adds it to the system prompt. A line under the banner says whether it was found and ingested.
 
 ## Model notes
 

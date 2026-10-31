@@ -301,12 +301,28 @@ Rules:
 - After making changes, verify them (run tests, the build, or the script) when that is possible.
 - Keep replies short. When the task is done, say what you changed in a few sentences and stop calling tools.
 """
-    for name in ("AGENTS.md", "LOCALCODE.md", "CLAUDE.md"):
-        f = root / name
-        if f.is_file():
-            prompt += f"\nProject instructions from {name}:\n{f.read_text(errors='replace')[:8000]}\n"
-            break
-    return prompt
+    instructions = find_instructions(root)
+    if instructions:
+        prompt += f"\nProject instructions from {instructions.name}:\n{instructions.read_text(errors='replace')[:8000]}\n"
+    return prompt, instructions
+
+
+def find_instructions(root):
+    """Return the project's instructions file (AGENTS.md first, any capitalization), or None."""
+    try:
+        files = {e.name.lower(): e for e in root.iterdir() if e.is_file()}
+    except OSError:
+        return None
+    for name in ("agents.md", "localcode.md", "claude.md"):
+        if name in files:
+            return files[name]
+    return None
+
+
+def instructions_status(path):
+    if path:
+        return green(f"✓ {path.name} found and ingested")
+    return dim("✗ no AGENTS.md found")
 
 
 # ---------------------------------------------------------------- model client
@@ -375,7 +391,8 @@ class Agent:
         self.reset()
 
     def reset(self):
-        self.messages = [{"role": "system", "content": system_prompt(self.tools.root)}]
+        prompt, self.instructions = system_prompt(self.tools.root)
+        self.messages = [{"role": "system", "content": prompt}]
 
     def chat_once(self):
         """Stream one assistant turn. Returns (content, tool_calls)."""
@@ -507,6 +524,7 @@ def main():
         return
 
     print(bold("localcode") + dim(f"  {agent.model}  ·  {tools.root}  ·  /help for commands"))
+    print(instructions_status(agent.instructions))
     while True:
         try:
             text = read_input()
@@ -523,7 +541,7 @@ def main():
                 print(HELP)
             elif cmd == "/clear":
                 agent.reset()
-                print(dim("Conversation cleared."))
+                print(dim("Conversation cleared. ") + instructions_status(agent.instructions))
             elif cmd == "/models":
                 for m in list_models():
                     print(("* " if m == agent.model else "  ") + m)
