@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1050" height="753" viewBox="0 0 1050 753"><title>localcode terminal interface preview</title><rect width="1050" height="753" rx="12" fill="#0e1420"/>
+<circle cx="30" cy="26" r="6" fill="#f27d88"/>
+<circle cx="53" cy="26" r="6" fill="#f5cf8b"/>
+<circle cx="76" cy="26" r="6" fill="#86d3ad"/>
+<g font-family="DejaVu Sans Mono, monospace" font-size="16" xml:space="preserve">
+<text x="45" y="74" fill="#8ac9fa">◆</text>
+<text x="65" y="74" fill="#f8fafc">localcode</text>
+<text x="155" y="74" fill="#8290a6">  /  Ollama</text>
+<text x="45" y="99" fill="#8290a6">~/code/localcode</text>
+<text x="25" y="149" fill="#f8fafc">Your project. Your models.</text>
+<text x="25" y="174" fill="#8290a6">Start with a task, or explore before making changes.</text>
+<text x="25" y="224" fill="#8ac9fa">  ❯</text>
+<text x="65" y="224" fill="#cbd5e1">Explain how this project works</text>
+<text x="25" y="249" fill="#8ac9fa">  ❯</text>
+<text x="65" y="249" fill="#cbd5e1">Find the cause of a bug and propose a fix</text>
+<text x="25" y="299" fill="#8290a6">/model</text>
+<text x="85" y="299" fill="#cbd5e1"> choose a model</text>
+<text x="265" y="299" fill="#8290a6">/help</text>
+<text x="315" y="299" fill="#cbd5e1"> keys and commands</text>
+<text x="25" y="324" fill="#8290a6">No project instructions · add AGENTS.md to guide your agent</text>
+<text x="25" y="374" fill="#8ac9fa">❯</text>
+<text x="45" y="374" fill="#f8fafc">Help me improve this project</text>
+<text x="25" y="424" fill="#cbd5e1">I can help you explore the code, make changes, and verify the result.</text>
+<text x="25" y="474" fill="#8290a6">Use /copy for the last reply, or /export to keep a Markdown transcript.</text>
+<text x="25" y="599" fill="#8290a6">────────────────────────────────────────────────────────────────────────────────────────────────────</text>
+<text x="25" y="624" fill="#8ac9fa">❯</text>
+<text x="45" y="624" fill="#cbd5e1">Review the terminal UI</text>
+<text x="25" y="649" fill="#8ac9fa">·</text>
+<text x="45" y="649" fill="#cbd5e1">and suggest accessibility improvements</text>
+<text x="25" y="674" fill="#8290a6">────────────────────────────────────────────────────────────────────────────────────────────────────</text>
+<text x="25" y="699" fill="#cbd5e1">  gpt-oss:20b</text>
+<text x="155" y="699" fill="#8290a6"> ·</text>
+<text x="185" y="699" fill="#86d3ad">ask to edit</text>
+<text x="295" y="699" fill="#8290a6"> ·</text>
+<text x="325" y="699" fill="#86d3ad">▰▱▱▱▱▱▱▱ 16% context</text>
+<text x="525" y="699" fill="#8290a6"> ·</text>
+<text x="555" y="699" fill="#cbd5e1">18.4 tok/s</text>
+<text x="25" y="724" fill="#8290a6">  / commands · Ctrl-R history · Ctrl-O newline · PgUp scroll</text>
+</g></svg>

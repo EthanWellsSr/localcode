@@ -14,6 +14,59 @@ import localcode as lc
 
 
 class TerminalTextTests(unittest.TestCase):
+    def test_export_excludes_internal_context_and_refuses_overwrite(self):
+        with tempfile.TemporaryDirectory() as directory:
+            agent = lc.Agent("example:7b", lc.Tools(directory))
+            agent.messages.extend([
+                {"role": "user", "content": "Explain this"},
+                {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "read_file"}}]},
+                {"role": "tool", "content": "internal file contents"},
+                {"role": "assistant", "content": "A **useful** reply."},
+            ])
+            path = lc.export_conversation(agent, "my notes.md")
+            text = path.read_text()
+            self.assertIn("## You\n\nExplain this", text)
+            self.assertIn("A **useful** reply.", text)
+            self.assertNotIn("internal file contents", text)
+            self.assertNotIn("You are localcode", text)
+            with self.assertRaises(FileExistsError):
+                lc.export_conversation(agent, "my notes.md")
+            self.assertEqual(path.read_text(), text)
+
+    def test_copy_uses_mac_clipboard_without_shell(self):
+        agent = lc.Agent("example:7b", lc.Tools(tempfile.gettempdir()))
+        agent.messages.append({"role": "assistant", "content": "hello $(literal)"})
+        with patch.object(lc.sys, "platform", "darwin"), patch.object(lc.shutil, "which", return_value="/usr/bin/pbcopy"):
+            with patch.object(lc.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as run:
+                lc.copy_reply(agent)
+                self.assertEqual(run.call_args.args[0], ["pbcopy"])
+                self.assertEqual(run.call_args.kwargs["input"], "hello $(literal)")
+                self.assertNotIn("shell", run.call_args.kwargs)
+        with patch.object(lc.shutil, "which", return_value=None):
+            with self.assertRaisesRegex(ValueError, "No clipboard"):
+                lc.copy_reply(agent)
+
+    def test_command_palette_can_find_commands_by_description(self):
+        screen = lc.Screen(lc.Agent("example", lc.Tools(tempfile.gettempdir())))
+        screen.buf, screen.menu_closed = list("/clipboard"), False
+        self.assertEqual(screen.menu_items()[0][0], "/copy")
+        rows = ["big-model 30B 20 GB", "small-model 7B 4 GB", "other-model 7B 5 GB"]
+        self.assertEqual(lc.picker_matches(rows, "7b 5"), [2])
+
+    def test_multiline_editor_moves_between_lines_without_sending(self):
+        screen = lc.Screen(lc.Agent("example", lc.Tools(tempfile.gettempdir())))
+        screen.buf, screen.pos, screen.menu_closed = list("first"), 5, False
+        self.assertIsNone(screen._handle_key("\x0f", []))
+        screen._handle_key(("paste", "second"), [])
+        screen._handle_key("up", [])
+        self.assertEqual(screen.pos, 5)
+        screen._handle_key("home", [])
+        self.assertEqual(screen.pos, 0)
+        screen._handle_key("down", [])
+        self.assertEqual(screen.pos, 6)
+        screen._handle_key("end", [])
+        self.assertEqual(screen._handle_key("\r", []), "first\nsecond")
+
     def test_unicode_fits_terminal_cells(self):
         text = "\033[36m项目 cafe\u0301\033[0m"
         self.assertEqual(lc.visible_len(text), 9)
@@ -148,11 +201,15 @@ lc.main()
             process = subprocess.Popen([sys.executable, "-c", FAKE_BACKEND, "-C", directory],
                                        stdin=slave, stdout=slave, stderr=slave, env=env)
 
+            search_cursor = 0
+
             def wait_for(text):
+                nonlocal search_cursor
                 deadline = time.monotonic() + 5
-                start = len(output)
                 while time.monotonic() < deadline:
-                    if text.encode() in output[start:]:
+                    position = output.find(text.encode(), search_cursor)
+                    if position != -1:
+                        search_cursor = position + len(text.encode())
                         return
                     if select.select([master], [], [], 0.1)[0]:
                         output.extend(os.read(master, 65536))
@@ -168,6 +225,25 @@ lc.main()
                 wait_for("Received:")
                 os.write(master, b"/status\r")
                 wait_for("Allowed this session")
+                wait_for("\x1b[?2004h")
+                os.write(master, b"\x12")
+                wait_for("Prompt history")
+                os.write(master, b"hello")
+                time.sleep(0.1)
+                os.write(master, b"\r")
+                wait_for("/ commands")
+                os.write(master, b"\x12")
+                wait_for("Prompt history")
+                os.write(master, b"\x1b")
+                wait_for("/ commands")
+                # Selected history is a draft, not an automatic model request.
+                os.write(master, b"\x15/model\r")
+                wait_for("Choose your Ollama model")
+                os.write(master, b"second")
+                time.sleep(0.1)
+                os.write(master, b"\r")
+                wait_for("Switched to ")
+                wait_for("\x1b[?2004h")
                 os.write(master, b"\x1b[5~")
                 wait_for("scrolled back")
                 fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 12, 30, 0, 0))
@@ -189,6 +265,8 @@ lc.main()
                 self.assertNotIn(b"Traceback", output)
                 history = json.loads((Path(directory) / "localcode/history.jsonl").read_text().splitlines()[0])
                 self.assertEqual(history, "项目\nhello")
+                entries = [json.loads(line) for line in (Path(directory) / "localcode/history.jsonl").read_text().splitlines()]
+                self.assertEqual(entries.count("项目\nhello"), 1)
             finally:
                 if process.poll() is None:
                     process.kill()

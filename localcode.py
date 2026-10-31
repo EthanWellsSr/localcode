@@ -846,6 +846,9 @@ class Agent:
 COMMANDS = {
     "/model": "pick a model, or /model <name> to switch straight to one",
     "/status": "show model, workspace, context, and approvals",
+    "/history": "search past prompts and put one back in the editor",
+    "/copy": "copy the last reply to the clipboard",
+    "/export": "save this conversation as Markdown: /export [path]",
     "/clear": "start a fresh conversation",
     "/yolo": "toggle auto-approve for writes and commands",
     "/help": "show commands and keys",
@@ -857,6 +860,8 @@ Keys:
   /          suggest commands (↑/↓ to choose, Tab to complete, Enter to run, Esc to close)
   ↑/↓        step through past entries
   PgUp/PgDn  scroll the conversation (mouse wheel also works)
+  Ctrl-R     search prompt history without sending it
+  Ctrl-O     insert a new line (Enter sends)
   Ctrl-D     quit on an empty line
   \\ + Enter  start a new line
   Ctrl-C     clear the line; on an empty line, quit"""
@@ -895,81 +900,122 @@ def model_details():
     return details
 
 
+def picker_matches(rows, query):
+    words = query.casefold().split()
+    return [i for i, row in enumerate(rows)
+            if all(word in ANSI_RE.sub("", row).casefold() for word in words)]
+
+
 def pick(rows, start=0, title=""):
-    """Arrow-key list picker. Returns the chosen index, or None if cancelled."""
+    """Searchable, scrollable chooser. Returns the original row index, never a filtered index."""
     if not rows:
         return None
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
-        for i, r in enumerate(rows, 1):
-            print(f"  {i}. {r}")
+        for i, row in enumerate(rows, 1):
+            print(f"  {i}. {row}")
         try:
-            n = input("Number (blank to cancel): ").strip()
+            answer = input("Number (blank to cancel): ").strip()
         except EOFError:
             return None
-        return int(n) - 1 if n.isdigit() and 1 <= int(n) <= len(rows) else None
+        return int(answer) - 1 if answer.isdigit() and 1 <= int(answer) <= len(rows) else None
 
+    import codecs
     import select
     import termios
     import tty
 
     fd = sys.stdin.fileno()
     saved = termios.tcgetattr(fd)
-    sel = start if 0 <= start < len(rows) else 0
     out = term_out()
+    nested = isinstance(sys.stdout, Transcript)
+    query, selected, matches, pending = "", start if 0 <= start < len(rows) else 0, list(range(len(rows))), ""
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
 
-    def draw(first=False):
-        if not first:
-            out.write(f"\033[{len(rows)}A")
-        for i, r in enumerate(rows):
-            out.write("\r\033[K" + (cyan(f"❯ {r}") if i == sel else f"  {r}") + "\n")
+    def draw():
+        width, height = shutil.get_terminal_size()
+        capacity = max(1, height - 6)
+        first = max(0, min(selected - capacity // 2, len(matches) - capacity))
+        lines = [bold(title), cyan("Search ❯ ") + query, dim("─" * width)]
+        for position in range(first, min(len(matches), first + capacity)):
+            text = rows[matches[position]].replace("\n", " ↵ ")
+            lines.append((cyan("❯ ") + bold(text)) if position == selected else "  " + text)
+        if not matches:
+            lines.append(dim("No matches. Backspace to broaden your search."))
+        footer = f"{selected + 1 if matches else 0}/{len(matches)} · ↑↓ choose · Enter select · Esc cancel"
+        out.write("\033[H\033[2J" + "\r\n".join(clip_ansi(line, max(1, width - 1)) + "\033[0m"
+                                                     for line in lines[:max(1, height - 1)]))
+        out.write(f"\033[{max(1, height)};1H" + clip_ansi(dim(footer), max(1, width - 1)))
         out.flush()
 
-    out.write(dim(title) + "\n")
-    out.write("\033[?25l")
-    result = None
     try:
-        tty.setcbreak(fd)
-        draw(first=True)
+        if not nested:
+            out.write("\033[?1049h")
+        out.write("\033[r\033[?25l\033[?1000l")
+        tty.setraw(fd)
+        draw()
         while True:
-            ch = os.read(fd, 1)
-            if ch == b"\x1b":
-                if not select.select([fd], [], [], 0.05)[0]:
-                    break  # bare Esc
-                seq = os.read(fd, 2)
-                if seq == b"[A":
-                    sel = (sel - 1) % len(rows)
-                elif seq == b"[B":
-                    sel = (sel + 1) % len(rows)
-            elif ch in (b"\r", b"\n"):
-                result = sel
-                break
-            elif ch == b"k":
-                sel = (sel - 1) % len(rows)
-            elif ch == b"j":
-                sel = (sel + 1) % len(rows)
-            elif ch.isdigit() and 1 <= int(ch) <= len(rows):
-                sel = int(ch) - 1
-            elif ch in (b"q", b"\x03"):
-                break
+            if not select.select([fd], [], [], 0.2)[0]:
+                draw()  # also adapt if the window changed size
+                continue
+            chunk = os.read(fd, 4096)
+            if not chunk:
+                return None
+            data = pending + decoder.decode(chunk)
+            pending = ""
+            if data == "\x1b" and select.select([fd], [], [], 0.05)[0]:
+                pending = data
+                continue
+            index = 0
+            while index < len(data):
+                ch = data[index]
+                if ch == "\x1b" and index + 1 < len(data) and data[index + 1] == "[":
+                    end = index + 2
+                    while end < len(data) and not ("@" <= data[end] <= "~"):
+                        end += 1
+                    if end == len(data):
+                        pending = data[index:]
+                        break
+                    key = data[index + 2:end + 1]
+                    selected += {"A": -1, "B": 1, "5~": -max(1, shutil.get_terminal_size().lines - 6),
+                                 "6~": max(1, shutil.get_terminal_size().lines - 6)}.get(key, 0)
+                    index = end + 1
+                else:
+                    index += 1
+                    if ch in ("\x1b", "\x03", "\x04"):
+                        return None
+                    if ch in ("\r", "\n"):
+                        return matches[selected] if matches else None
+                    if ch in ("\x7f", "\x08"):
+                        query = query[:-1]
+                    elif ch == "\x15":
+                        query = ""
+                    elif ch.isprintable():
+                        query += ch
+                    else:
+                        continue
+                    matches, selected = picker_matches(rows, query), 0
+                selected = max(0, min(selected, len(matches) - 1))
             draw()
-    except KeyboardInterrupt:
-        pass
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, saved)
-        out.write(f"\033[{len(rows) + 1}A\r\033[J\033[?25h")  # erase the picker
+        out.write("\033[0m\033[?25h")
+        if nested:
+            out.write("\033[?1000h")
+        else:
+            out.write("\033[?1049l")
         out.flush()
-    return result
 
 
-def pick_model(current):
+
+def pick_model(current, chooser=pick):
     models = model_details()
-    width = max(len(m["name"]) for m in models) if models else 0
-    rows = [f"{m['name']:<{width}}  {m['params']:>6}  {m['size'] / 1e9:5.1f} GB"
+    width = min(35, max(visible_len(m["name"]) for m in models)) if models else 0
+    rows = [f"{abbreviate(m['name'], width):<{width}}  {m['params']:>6}  {m['size'] / 1e9:5.1f} GB"
             + ("  (current)" if m["name"] == current else "")
-            + ("" if m["tools"] else "  · no tool support") for m in models]
+            + ("  · native tools" if m["tools"] else "  · text fallback") for m in models]
     names = [m["name"] for m in models]
-    i = pick(rows, names.index(current) if current in names else 0,
-             "Select a model  (↑/↓ to move, Enter to choose, Esc to cancel)")
+    i = chooser(rows, names.index(current) if current in names else 0,
+             "Choose your Ollama model · type a name, size, or capability to filter")
     return names[i] if i is not None else None
 
 
@@ -1096,6 +1142,51 @@ def show_status(agent):
         print("  " + dim(f"{label:<21}") + value)
     if agent.last_speed:
         print("  " + dim(f"{'Last reply':<21}") + f"{agent.last_speed:.1f} tok/s")
+
+
+def conversation_markdown(agent):
+    """Export visible conversation only, excluding system prompts and tool output."""
+    parts = ["# localcode conversation", f"Model: {agent.model}\nWorkspace: {agent.tools.root}"]
+    for message in agent.messages:
+        role, content = message.get("role"), message.get("content", "")
+        if role not in ("user", "assistant") or not content:
+            continue
+        if role == "user" and content.startswith("Tool result for "):
+            continue
+        if role == "assistant" and (message.get("tool_calls") or parse_text_tool_calls(content)):
+            continue
+        parts.extend(["## You" if role == "user" else "## Assistant", content])
+    return "\n\n".join(parts) + "\n"
+
+
+def export_conversation(agent, filename=""):
+    name = filename.strip() or time.strftime("localcode-%Y%m%d-%H%M%S.md")
+    path = Path(name).expanduser()
+    if not path.is_absolute():
+        path = agent.tools.root / path
+    # A typo or repeated command must never silently replace an existing file.
+    with path.open("x", encoding="utf-8") as stream:
+        stream.write(conversation_markdown(agent))
+    return path
+
+
+def copy_reply(agent):
+    reply = next((m["content"] for m in reversed(agent.messages)
+                  if m.get("role") == "assistant" and m.get("content")
+                  and not m.get("tool_calls") and not parse_text_tool_calls(m["content"])), None)
+    if reply is None:
+        raise ValueError("No reply to copy yet. Ask the model a question first.")
+    candidates = [["pbcopy"]] if sys.platform == "darwin" else [
+        ["wl-copy"], ["xclip", "-selection", "clipboard"], ["xsel", "--clipboard", "--input"]]
+    command = next((c for c in candidates if shutil.which(c[0])), None)
+    if command is None:
+        raise ValueError("No clipboard utility found. Use /export to save the conversation instead.")
+    try:
+        result = subprocess.run(command, input=reply, text=True, capture_output=True, timeout=5)
+    except subprocess.TimeoutExpired:
+        raise ValueError("Clipboard did not respond. Use /export instead.") from None
+    if result.returncode:
+        raise ValueError("Clipboard is unavailable in this terminal. Use /export instead.")
 
 
 def hard_wrap(line, width):
@@ -1229,6 +1320,9 @@ class Screen:
         self.history = []
         self.models = None    # installed model names, fetched when the /model menu first needs them
         self.resize_handler = None
+        self.prefill = ""
+        self.choosing = False
+        self.input_rows = 1
 
     # ---- layout
 
@@ -1255,6 +1349,9 @@ class Screen:
         self.w, self.h = max(1, size.columns), max(1, size.lines)
         self.header = header_lines(self.agent, self.w, self.h)
         self.top = len(self.header)
+        lines = self.text().count("\n") + 1 if self.reading else 1
+        self.input_rows = max(1, min(lines, 5, self.h - self.top - 7))
+        self.FRAME = 4 + self.input_rows
         self.extra = min(self.extra, max(0, self.h - self.FRAME - self.top - 3))
         self.bottom = self.h - self.FRAME - self.extra
 
@@ -1292,7 +1389,7 @@ class Screen:
         print("\n".join(welcome_lines(self.agent)))
 
     def on_resize(self):
-        if not self.active:
+        if not self.active or self.choosing:
             return
         self.redraw_all()
         if self.reading:
@@ -1358,7 +1455,7 @@ class Screen:
             return "  " + cyan(f"↑ scrolled back {self.offset} lines") + dim(" · scroll down or PgDn to return")
         if self.agent.tools.auto_approve:
             return "  " + yellow("⏵⏵ auto-approve on") + dim(" (/yolo to turn off)")
-        return dim("  / commands · ↑↓ history · PgUp scroll · Ctrl-C clear / quit")
+        return dim("  / commands · Ctrl-R history · Ctrl-O newline · PgUp scroll")
 
     def fit(self, line):
         """Cut a line to the window width; a line that wraps would spill into the rows below it."""
@@ -1371,9 +1468,9 @@ class Screen:
         rule = dim("─" * self.w)
         row = self.bottom + 1
         below = below if below is not None else [self.status_text(), self.hint_text()]
-        out = ("\0337" if save else "") + f"\033[{row};1H\033[2K" + rule + f"\033[{row + 2};1H\033[2K" + rule
+        out = ("\0337" if save else "") + f"\033[{row};1H\033[2K" + rule + f"\033[{row + self.input_rows + 1};1H\033[2K" + rule
         for i in range(2 + self.extra):
-            out += f"\033[{row + 3 + i};1H\033[2K" + (self.fit(below[i]) if i < len(below) else "")
+            out += f"\033[{row + self.input_rows + 2 + i};1H\033[2K" + (self.fit(below[i]) if i < len(below) else "")
         self._w(out + ("\0338" if save else ""))
 
     # ---- the line editor
@@ -1391,15 +1488,37 @@ class Screen:
                     self.models = []
             q = t[len("/model "):]
             return [("/model " + m, m, "current" if m == self.agent.model else "")
-                    for m in self.models if m.startswith(q)][:self.MAX_MENU]
+                    for m in self.models if q.casefold() in m.casefold()]
         if t.startswith("/") and " " not in t:
-            return [(c, c, d) for c, d in COMMANDS.items() if c.startswith(t)][:self.MAX_MENU]
+            query = t[1:].casefold()
+            return sorted([(c, c, d) for c, d in COMMANDS.items()
+                           if query in c.casefold() or query in d.casefold()],
+                          key=lambda item: not item[0].startswith(t))
         return []
+
+    def choose(self, rows, start=0, title=""):
+        self.choosing = True
+        try:
+            return pick(rows, start, title)
+        finally:
+            self.choosing = False
+            self.redraw_all()
+
+    def search_history(self):
+        entries = list(dict.fromkeys(reversed(self.history)))
+        if not entries:
+            return None
+        selected = self.choose(entries, title="Prompt history · type to search · Enter returns to editing")
+        return entries[selected] if selected is not None else None
 
     def text(self):
         return "".join(self.buf)
 
     def render(self):
+        previous_rows = self.input_rows
+        self._layout()
+        if previous_rows != self.input_rows:
+            self.redraw_all()
         items = self.menu_items()
         if self.too_small():
             return items
@@ -1407,24 +1526,35 @@ class Screen:
         self.grow(max(0, len(items) - 2))
         if items:
             width = max(len(label) for _, label, _ in items) + 3
+            count = 2 + self.extra
+            first = max(0, min(self.sel - count + 1, len(items) - count))
             below = [(cyan("  ❯ " + label.ljust(width)) if i == self.sel else "    " + label.ljust(width)) + dim(desc)
-                     for i, (_, label, desc) in enumerate(items)]
+                     for i, (_, label, desc) in enumerate(items) if first <= i < first + count]
         else:
             below = None
         self.draw_frame(save=False, below=below)
-        # The prompt row: scroll horizontally so the cursor stays visible; show newlines as ↵.
-        shown = self.text().replace("\n", "↵")
+        # A small composer: grow for multiline text, then scroll around the cursor.
+        lines = self.text().split("\n")
+        before = self.text()[:self.pos]
+        cursor_line = before.count("\n")
+        cursor_column = len(before.rsplit("\n", 1)[-1])
+        first_line = max(0, cursor_line - self.input_rows + 1)
         avail = max(0, self.w - 3)
-        start = self.pos
-        while start and visible_len(shown[start - 1:self.pos]) <= avail:
+        start = cursor_column
+        while start and visible_len(lines[cursor_line][start - 1:cursor_column]) <= avail:
             start -= 1
         row = self.bottom + 2
-        if shown:
-            line = cyan("❯ ") + clip_ansi(shown[start:], avail)
-        else:
-            line = cyan("❯ ") + dim(PLACEHOLDER)
-        cursor = min(self.w, 3 + visible_len(shown[start:self.pos]))
-        self._w(f"\033[{row};1H\033[2K" + self.fit(line) + f"\033[{row};{cursor}H")
+        out = ""
+        for i in range(self.input_rows):
+            number = first_line + i
+            text = lines[number] if number < len(lines) else ""
+            shift = start if number == cursor_line else 0
+            line = cyan("❯ " if number == 0 else "· ") + clip_ansi(text[shift:], avail)
+            if not self.text():
+                line = cyan("❯ ") + dim(PLACEHOLDER)
+            out += f"\033[{row + i};1H\033[2K" + self.fit(line)
+        cursor = min(self.w, 3 + visible_len(lines[cursor_line][start:cursor_column]))
+        self._w(out + f"\033[{row + cursor_line - first_line};{cursor}H")
         return items
 
     def read_line(self):
@@ -1442,6 +1572,10 @@ class Screen:
         decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
 
         self.buf, self.pos, self.sel, self.menu_closed, self.in_paste = [], 0, 0, False, False
+        if self.prefill:
+            self.buf, self.pos = list(self.prefill), len(self.prefill)
+            self.prefill = ""
+            self.menu_closed = True
         self.models = None  # refresh installed model suggestions for each new entry
         hist_i, draft = len(self.history), ""
         self._w("\033[?2004h")  # bracketed paste, so multi-line pastes arrive as one piece
@@ -1485,17 +1619,16 @@ class Screen:
                         continue
                     result = self._handle_key(key, items)
                     if result is None:
-                        if key in ("up", "down") and not items:
+                        if key in ("up", "down") and not items and "\n" not in self.text():
                             hist_i, draft = self._history_step(key, hist_i, draft)
                         items = self.render()
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, saved_tty)
             self.reading = False
             self.offset = 0
-            self.grow(0)
-            self.draw_frame(save=False)
-            self._w(f"\033[{self.bottom + 2};1H\033[2K" + "\033[?2004l")
-            self.render_view()  # back to the newest output, cursor where the next output goes
+            self.extra = 0
+            self._w("\033[?2004l")
+            self.redraw_all()  # shrink the composer and return to the newest output
         if isinstance(result, BaseException):
             raise result
         if result and (not self.history or self.history[-1] != result):
@@ -1549,6 +1682,15 @@ class Screen:
             text = key[1].replace("\r\n", "\n").replace("\r", "\n")
             buf[pos:pos] = list(text)
             self.pos += len(text)
+        elif key == "\x12":  # Ctrl-R: select a past prompt, then keep editing
+            text = self.search_history()
+            if text is not None:
+                self.buf, self.pos = list(text), len(text)
+                self.menu_closed = True
+            return None
+        elif key == "\x0f":  # Ctrl-O inserts without sending
+            buf.insert(pos, "\n")
+            self.pos += 1
         elif key in ("\r", "\n"):
             if items:
                 return items[self.sel][0]
@@ -1564,6 +1706,12 @@ class Screen:
         elif key in ("up", "down") and items:
             self.sel = (self.sel + (1 if key == "down" else -1)) % len(items)
             return None
+        elif key in ("up", "down") and "\n" in before:
+            lines = before.split("\n")
+            current = before[:pos].count("\n")
+            column = len(before[:pos].rsplit("\n", 1)[-1])
+            target = max(0, min(len(lines) - 1, current + (1 if key == "down" else -1)))
+            self.pos = sum(len(line) + 1 for line in lines[:target]) + min(column, len(lines[target]))
         elif key == "esc":
             self.menu_closed = True
             return None
@@ -1588,9 +1736,10 @@ class Screen:
         elif key in ("right", "\x06"):
             self.pos = min(len(buf), pos + 1)
         elif key in ("home", "\x01"):
-            self.pos = 0
+            self.pos = before.rfind("\n", 0, pos) + 1
         elif key in ("end", "\x05"):
-            self.pos = len(buf)
+            end = before.find("\n", pos)
+            self.pos = len(buf) if end == -1 else end
         elif key == "\x15":  # Ctrl-U
             del buf[:pos]
             self.pos = 0
@@ -1723,6 +1872,22 @@ def main():
                         print(HELP)
                     elif cmd == "/status":
                         show_status(agent)
+                    elif cmd == "/copy":
+                        copy_reply(agent)
+                        print(green("Copied the last reply to your clipboard."))
+                    elif cmd == "/export":
+                        path = export_conversation(agent, rest)
+                        print(green(f"Conversation saved to {path}"))
+                    elif cmd == "/history":
+                        if screen.active:
+                            selected = screen.search_history()
+                            if selected is not None:
+                                screen.prefill = selected
+                        else:
+                            entries = list(dict.fromkeys(reversed(load_editor_history())))
+                            choice = pick(entries, title="Prompt history")
+                            if choice is not None:
+                                print(bold("Selected prompt (copy to edit):") + "\n" + entries[choice])
                     elif cmd == "/clear":
                         agent.reset()
                         if screen.active:
@@ -1732,7 +1897,7 @@ def main():
                     elif cmd in ("/model", "/models"):
                         name = rest.strip()
                         if not name:
-                            name = pick_model(agent.model)
+                            name = pick_model(agent.model, chooser=screen.choose if screen.active else pick)
                         elif name not in list_models():
                             print(red(f"{name} isn't installed.") + dim(" Run /model to pick from the installed ones."))
                             continue

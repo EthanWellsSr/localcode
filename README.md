@@ -2,6 +2,10 @@
 
 A terminal coding agent built around local [Ollama](https://ollama.com) models. One Python file, standard library only.
 
+![An illustrative localcode session rendered from the terminal interface, showing the multiline composer and session status](docs/terminal-preview.svg)
+
+*Sample conversation rendered from the interface. Colors and fonts follow your terminal's settings.*
+
 ## Install
 
 Needs Python 3.9+ and [Ollama](https://ollama.com).
@@ -70,12 +74,17 @@ Replies are rendered as Markdown while they stream: headings and **bold** in bol
 
 ## Commands and keys
 
-Type `/` and a menu of commands appears under the input: ↑/↓ to choose, Tab to complete, Enter to run, Esc to close. After `/model ` it suggests your installed models.
+Type `/` and a menu of commands appears under the input: ↑/↓ to choose, Tab to complete, Enter to run, Esc to close. Search by name or description: `/clipboard` finds `/copy`. The menu scrolls as you move through its results. After `/model ` it searches your installed models.
+
+The model picker is searchable too: type part of a name, parameter size, or `native tools` / `text fallback`. ↑/↓ moves through results, PgUp/PgDn moves a page, Enter chooses, and Esc cancels. It keeps the current model selected when first opened and adapts to your window size.
 
 | Command | |
 | --- | --- |
 | `/model` | Open the model picker, or `/model <name>` to switch straight to one |
 | `/status` | Show the model, Ollama address, workspace, instructions, context, and approvals |
+| `/history` | Search saved prompts; in full-screen mode, the selected prompt returns to editing without being sent |
+| `/copy` | Copy the last assistant reply to the clipboard (`pbcopy` on macOS) |
+| `/export [path]` | Save a Markdown conversation; defaults to a timestamped file in the workspace and refuses to overwrite files |
 | `/clear` | Start a fresh conversation (re-reads `AGENTS.md`) |
 | `/yolo` | Toggle auto-approve for writes and commands |
 | `/help` | Show commands and keys |
@@ -85,12 +94,23 @@ Type `/` and a menu of commands appears under the input: ↑/↓ to choose, Tab 
 | --- | --- |
 | Mouse wheel, PgUp/PgDn, Shift+↑/↓ | Scroll back through the conversation |
 | ↑/↓ | Step through past entries (saved across sessions in `~/.config/localcode/history.jsonl`) |
+| Ctrl-R | Search prompt history and return a selection to the editor without sending it |
+| Ctrl-O | Insert a newline; the composer grows to five lines and scrolls for longer prompts |
+| ↑/↓ in a multiline draft | Move between lines; Ctrl-A / Ctrl-E moves to the start/end of the current line |
 | `\` then Enter | Start a new line; pasting multi-line text also works |
 | Ctrl-C | Clear the line; on an empty line, quit |
 | Ctrl-D | Quit on an empty line; otherwise delete the next character |
 | Ctrl-A / Ctrl-E, Ctrl-U / Ctrl-K, Ctrl-W | Start/end of line, delete to start/end, delete word |
 
 The model you pick is remembered for next time (in `~/.config/localcode/state.json`); switching keeps the conversation.
+
+## Keep useful work
+
+Use Ctrl-R to find a previous prompt by a few words. Select it, revise it in the composer, then press Enter when ready. Cancelling keeps your current draft. In `--plain` mode, `/history` offers numbered selection and prints the chosen prompt for copying; readline also provides your shell's usual history search.
+
+After a useful reply, `/copy` puts its original Markdown on the Mac clipboard, including code fences. On Linux it tries `wl-copy`, `xclip`, or `xsel` if installed. If the terminal has no clipboard access, it points you to `/export`.
+
+Use `/export notes.md` to keep the conversation in your project, or `/export` for a timestamped filename. Export includes user messages and assistant replies without internal instructions, tool-call payloads, or file contents returned by tools. It creates a new file and never overwrites one. These commands do not make model requests or change the current context.
 
 ## Settings
 
