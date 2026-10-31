@@ -36,6 +36,8 @@ Writes, edits and shell commands show a diff or the command and ask before runni
 
 ## Output
 
+localcode takes over the terminal window: the header sits at the top, the conversation scrolls in the middle, and the input box stays pinned to the bottom with a status line under it showing the model, the folder, how much of the context window is used, and the last reply's speed. Reasoning models' thinking is collapsed to a single "✻ Thought for Ns" line (set `LOCALCODE_SHOW_THINKING=1` to see it). When you quit, the input box is cleared and your shell prompt picks up right under the conversation.
+
 Replies are rendered as Markdown while they stream: headings and **bold** in bold, `code` in color, bullets as •, code blocks with a side bar, and tables drawn as aligned boxes that fit the terminal width. When output is piped instead of shown in a terminal, the raw Markdown is passed through.
 
 ## REPL commands
@@ -57,6 +59,7 @@ Replies are rendered as Markdown while they stream: headings and **bold** in bol
 | `LOCALCODE_MODEL` | the last model you picked, else `gpt-oss:20b` |
 | `LOCALCODE_NUM_CTX` | `32768` |
 | `OLLAMA_HOST` | `http://localhost:11434` |
+| `LOCALCODE_SHOW_THINKING` | off; `1` prints reasoning models' thinking in full |
 
 On startup, localcode looks for `AGENTS.md` (any capitalization) in the project and quietly adds it to the system prompt. A line under the banner says whether it was found and ingested.
 

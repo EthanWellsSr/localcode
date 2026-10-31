@@ -29,9 +29,11 @@ from pathlib import Path
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
 if not OLLAMA_HOST.startswith("http"):
     OLLAMA_HOST = "http://" + OLLAMA_HOST
+__version__ = "0.1.0"
 DEFAULT_MODEL = "gpt-oss:20b"
 NUM_CTX = int(os.environ.get("LOCALCODE_NUM_CTX", "32768"))
 MAX_STEPS = 40
+SHOW_THINKING = os.environ.get("LOCALCODE_SHOW_THINKING") == "1"  # else collapsed to "Thought for Ns"
 MAX_TOOL_OUTPUT = 24000
 READ_BUDGET = 12000  # chars per read_file call
 READ_FILES_BUDGET = 24000  # chars per read_files call
@@ -44,6 +46,9 @@ USE_COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
 
 def c(code, text):
     return f"\033[{code}m{text}\033[0m" if USE_COLOR else text
+
+
+DIM_ON = "\033[2m"  # re-enable dim after a nested color reset
 
 
 def dim(t): return c("2", t)
@@ -708,26 +713,47 @@ class Agent:
     def __init__(self, model, tools):
         self.model = model
         self.tools = tools
+        self.show_stats = True
         self.reset()
 
     def reset(self):
         prompt, self.instructions = system_prompt(self.tools.root)
         self.messages = [{"role": "system", "content": prompt}]
         self.tools.forget()
+        self.ctx_used, self.last_speed = 0, 0.0
 
     def chat_once(self):
         """Stream one assistant turn. Returns (content, tool_calls, native)."""
         payload = {"model": self.model, "messages": self.messages, "tools": TOOL_SCHEMAS,
                    "stream": True, "options": {"num_ctx": NUM_CTX}}
-        tool_calls, thinking_shown = [], False
+        tool_calls = []
         printer = StreamPrinter()
         stats = {}
         spinner = Spinner()
+        think_start = None
         try:
             for chunk in ollama("/api/chat", payload, stream=True):
+                if "error" in chunk:
+                    raise RuntimeError(chunk["error"])
+                msg = chunk.get("message", {})
+                if msg.get("thinking"):
+                    # Reasoning models think before answering: keep the spinner going and collapse it to one line.
+                    if think_start is None:
+                        think_start = time.monotonic()
+                        spinner.label = "thinking"
+                    if SHOW_THINKING:
+                        spinner.stop()
+                        print(dim(msg["thinking"]), end="", flush=True)
+                if not (msg.get("content") or msg.get("tool_calls") or chunk.get("done")):
+                    continue
                 spinner.stop()
-                thinking_shown, done = self._handle_chunk(chunk, printer, tool_calls, thinking_shown)
-                if done:
+                if think_start is not None:
+                    print(("\n" if SHOW_THINKING else "") + dim(f"✻ Thought for {time.monotonic() - think_start:.0f}s"))
+                    think_start = None
+                if msg.get("content"):
+                    printer.feed(msg["content"])
+                tool_calls.extend(msg.get("tool_calls") or [])
+                if chunk.get("done"):
                     stats = chunk
         finally:
             spinner.stop()
@@ -737,31 +763,16 @@ class Agent:
             tool_calls = parse_text_tool_calls(content)
         # Text that turned out to be a tool call stays hidden; the ● line below shows it instead.
         printer.finish(show_held=native or not tool_calls)
-        if printer.needs_newline or thinking_shown:
+        if printer.needs_newline:
             print()
         if stats.get("eval_count"):
             secs = stats.get("eval_duration", 1) / 1e9
-            ctx = stats.get("prompt_eval_count", 0) + stats["eval_count"]
-            print(dim(f"  [{stats['eval_count']} tok, {stats['eval_count'] / secs:.1f} tok/s, ctx ~{ctx}/{NUM_CTX}]"))
+            self.ctx_used = stats.get("prompt_eval_count", 0) + stats["eval_count"]
+            self.last_speed = stats["eval_count"] / secs
+            if self.show_stats:
+                print(dim(f"  [{stats['eval_count']} tok, {self.last_speed:.1f} tok/s, ctx ~{self.ctx_used}/{NUM_CTX}]"))
         return content, tool_calls, native
 
-    def _handle_chunk(self, chunk, printer, tool_calls, thinking_shown):
-        """Print one streamed chunk. Returns (thinking_shown, done)."""
-        if "error" in chunk:
-            raise RuntimeError(chunk["error"])
-        msg = chunk.get("message", {})
-        if msg.get("thinking"):
-            if not thinking_shown:
-                print(dim("thinking: "), end="")
-                thinking_shown = True
-            print(dim(msg["thinking"]), end="", flush=True)
-        if msg.get("content"):
-            if thinking_shown:
-                print()
-                thinking_shown = False
-            printer.feed(msg["content"])
-        tool_calls.extend(msg.get("tool_calls") or [])
-        return thinking_shown, bool(chunk.get("done"))
 
     def run(self, user_input):
         self.messages.append({"role": "user", "content": user_input})
@@ -979,16 +990,166 @@ def setup_readline():
         readline.parse_and_bind("tab: complete")
 
 
-def read_input():
+def read_input(screen=None):
     lines = []
     while True:
-        line = input(prompt(bold("> ")) if not lines else "  ")
+        marker = "❯ " if not lines else "… "
+        if screen and screen.active:
+            line = screen.read_line(prompt(cyan(marker)))
+        else:
+            line = input(prompt(bold(marker)))
         drop_last_history(only_if_duplicate=True)  # like a shell, don't store the same line twice in a row
         if line.endswith("\\"):
             lines.append(line[:-1])
             continue
         lines.append(line)
         return "\n".join(lines).strip()
+
+
+def fmt_tokens(n):
+    return f"{n / 1000:.1f}k" if n >= 1000 else str(n)
+
+
+def short_path(p):
+    home = str(Path.home())
+    p = str(p)
+    return "~" + p[len(home):] if p == home or p.startswith(home + os.sep) else p
+
+
+ICON = ["▛▀▀▀▀▀▜", "▌ >_  ▐", "▙▄▄▄▄▄▟"]
+
+
+def header_lines(agent):
+    info = [bold("localcode") + dim(f" v{__version__}"),
+            dim(f"{agent.model} · Ollama"),
+            dim(short_path(agent.tools.root))]
+    return [cyan(icon) + "   " + text for icon, text in zip(ICON, info)]
+
+
+class Screen:
+    """Full-window layout: the conversation scrolls above, the input box and status stay pinned below.
+
+    Uses a terminal scroll region (rows 1..bottom) for the transcript; the last FRAME rows hold
+    a rule, the prompt line, a rule, the status line and a hint line. Falls back to plain inline
+    prompts when the output isn't a terminal or the window is too small.
+    """
+
+    FRAME = 5
+    MIN_ROWS = 12
+
+    def __init__(self, agent):
+        self.agent = agent
+        self.active = False
+        self.reading = False  # True while input() is waiting in the prompt row
+        self.marker = ""
+
+    def start(self):
+        if not (USE_COLOR and sys.stdin.isatty()) or shutil.get_terminal_size().lines < self.MIN_ROWS:
+            return
+        self.active = True
+        atexit.register(self.stop)
+        try:
+            import signal
+            signal.signal(signal.SIGWINCH, lambda *_: self.on_resize())
+        except (ImportError, AttributeError, ValueError):
+            pass
+        self.redraw_all()
+
+    def _layout(self):
+        size = shutil.get_terminal_size()
+        self.w, self.h = size.columns, size.lines
+        self.bottom = self.h - self.FRAME
+
+    def _w(self, s):
+        sys.stdout.write(s)
+        sys.stdout.flush()
+
+    def redraw_all(self):
+        """Clear the window, then draw the header at the top and the input frame at the bottom."""
+        self._layout()
+        self._w("\033[2J" + f"\033[1;{self.bottom}r" + "\033[H")
+        print()
+        for line in header_lines(self.agent):
+            print("  " + line)
+        print()
+        print("  " + instructions_status(self.agent.instructions))
+        print()
+        self.gap = False  # the header already ends with a blank line
+        self.draw_frame()
+
+    def on_resize(self):
+        if not self.active:
+            return
+        self._layout()
+        if not self.reading:
+            # Setting the scroll region homes the cursor, so keep the transcript position around it.
+            self._w("\0337" + f"\033[1;{self.bottom}r" + "\0338")
+            self.draw_frame()
+            return
+        # Mid-prompt: the saved cursor slot holds the transcript position, so don't touch it.
+        # Redraw the frame and put the prompt and what's been typed so far on the new prompt row.
+        try:
+            import readline
+            typed = readline.get_line_buffer()
+        except ImportError:
+            typed = ""
+        marker = self.marker.replace("\001", "").replace("\002", "")
+        self._w(f"\033[1;{self.bottom}r")
+        self.draw_frame(save=False)
+        self._w(f"\033[{self.bottom + 2};1H\033[2K" + marker + typed)
+
+    def status_text(self):
+        a = self.agent
+        used = a.ctx_used
+        pct = round(100 * used / NUM_CTX) if NUM_CTX else 0
+        color = green if pct < 50 else yellow if pct < 80 else red
+        parts = [a.model, short_path(a.tools.root),
+                 "Context: " + color(f"{fmt_tokens(used)} / {fmt_tokens(NUM_CTX)} ({pct}%)") + DIM_ON]
+        if a.last_speed:
+            parts.append(f"{a.last_speed:.1f} tok/s")
+        return dim("  " + "  |  ".join(parts))
+
+    def hint_text(self):
+        if self.agent.tools.auto_approve:
+            return "  " + yellow("⏵⏵ auto-approve on") + dim(" (/yolo to turn off)")
+        return dim("  ? /help for commands · /model to switch models")
+
+    def draw_frame(self, save=True):
+        rule = dim("─" * self.w)
+        row = self.bottom + 1
+        self._w(("\0337" if save else "")
+                + f"\033[{row};1H\033[2K" + rule
+                + f"\033[{row + 1};1H\033[2K"
+                + f"\033[{row + 2};1H\033[2K" + rule
+                + f"\033[{row + 3};1H\033[2K" + self.status_text()
+                + f"\033[{row + 4};1H\033[2K" + self.hint_text()
+                + ("\0338" if save else ""))
+
+    def read_line(self, marker):
+        """Read one line in the pinned prompt row, then echo it into the transcript."""
+        self.draw_frame()
+        self._w("\0337" + f"\033[{self.bottom + 2};1H\033[2K")
+        self.marker, self.reading = marker, True
+        try:
+            line = input(marker)
+        finally:
+            self.reading = False
+            self._w(f"\033[{self.bottom + 2};1H\033[2K" + "\0338")
+        echo = line.rstrip("\\")
+        if echo:
+            if self.gap:
+                print()
+            print(cyan("❯ ") + bold(echo))
+            self.gap = True
+        return line
+
+    def stop(self):
+        if not self.active:
+            return
+        self.active = False
+        # Release the scroll region (which homes the cursor), go back to the end of the conversation
+        # and clear the input box below it, so the shell prompt lands right under the transcript.
+        self._w("\0337" + "\033[r" + "\0338" + "\033[J")
 
 
 def main():
@@ -1025,16 +1186,22 @@ def main():
         agent.run(" ".join(args.prompt))
         return
 
-    print(bold("localcode") + dim(f"  {agent.model}  ·  {tools.root}  ·  /help for commands"))
-    print(instructions_status(agent.instructions))
+    screen = Screen(agent)
+    screen.start()
+    agent.show_stats = not screen.active  # the status line shows them instead
+    if not screen.active:
+        print(bold("localcode") + dim(f"  {agent.model}  ·  {tools.root}  ·  /help for commands"))
+        print(instructions_status(agent.instructions))
     while True:
         try:
-            text = read_input()
+            text = read_input(screen)
         except (EOFError, KeyboardInterrupt):
             print()
             return
         if not text:
             continue
+        if screen.active:
+            print()
         if text.startswith("/"):
             cmd, _, rest = text.partition(" ")
             if cmd in ("/exit", "/quit"):
@@ -1043,7 +1210,10 @@ def main():
                 print(HELP)
             elif cmd == "/clear":
                 agent.reset()
-                print(dim("Conversation cleared. ") + instructions_status(agent.instructions))
+                if screen.active:
+                    screen.redraw_all()
+                else:
+                    print(dim("Conversation cleared. ") + instructions_status(agent.instructions))
             elif cmd in ("/model", "/models"):
                 name = rest.strip()
                 if not name:
