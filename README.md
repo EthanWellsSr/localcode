@@ -1,6 +1,6 @@
 # localcode
 
-A small opencode-style coding agent for local models running in [Ollama](https://ollama.com). One Python file, standard library only.
+A terminal coding agent built around local [Ollama](https://ollama.com) models. One Python file, standard library only.
 
 ## Install
 

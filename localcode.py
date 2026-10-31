@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""localcode: a small opencode-style coding agent for local Ollama models.
+"""localcode: a terminal coding agent built around local Ollama models.
 
 Usage:
     python3 localcode.py                     # interactive REPL
