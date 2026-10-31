@@ -36,13 +36,21 @@ Writes, edits and shell commands show a diff or the command and ask before runni
 
 ## REPL commands
 
-`/model [name]`, `/models`, `/clear`, `/yolo`, `/help`, `/exit`. End a line with `\` to keep typing on the next line.
+| Command | |
+| --- | --- |
+| `/model` | Open the model picker: ↑/↓ (or j/k) to move, Enter to choose, Esc to cancel |
+| `/model <name>` | Switch straight to a model; Tab completes names |
+| `/clear` | Start a fresh conversation (re-reads `AGENTS.md`) |
+| `/yolo` | Toggle auto-approve for writes and commands |
+| `/help`, `/exit` | |
+
+End a line with `\` to keep typing on the next line. The model you pick is remembered for next time (in `~/.config/localcode/state.json`); switching keeps the conversation.
 
 ## Settings
 
 | Env var | Default |
 | --- | --- |
-| `LOCALCODE_MODEL` | `gpt-oss:20b` |
+| `LOCALCODE_MODEL` | the last model you picked, else `gpt-oss:20b` |
 | `LOCALCODE_NUM_CTX` | `32768` |
 | `OLLAMA_HOST` | `http://localhost:11434` |
 

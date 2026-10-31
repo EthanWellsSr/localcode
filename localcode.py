@@ -27,7 +27,7 @@ from pathlib import Path
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
 if not OLLAMA_HOST.startswith("http"):
     OLLAMA_HOST = "http://" + OLLAMA_HOST
-DEFAULT_MODEL = os.environ.get("LOCALCODE_MODEL", "gpt-oss:20b")
+DEFAULT_MODEL = "gpt-oss:20b"
 NUM_CTX = int(os.environ.get("LOCALCODE_NUM_CTX", "32768"))
 MAX_STEPS = 40
 MAX_TOOL_OUTPUT = 24000
@@ -580,16 +580,155 @@ class Agent:
 # ---------------------------------------------------------------- REPL
 
 HELP = """Commands:
-  /model [name]   show or switch model
-  /models         list installed Ollama models
+  /model          pick a model (↑/↓ or j/k, Enter to choose, Esc to cancel)
+  /model <name>   switch straight to a model (Tab completes names)
   /clear          start a fresh conversation
   /yolo           toggle auto-approve for writes and commands
   /exit           quit
 End a line with \\ to continue on the next line."""
+COMMANDS = ["/model", "/clear", "/yolo", "/help", "/exit"]
+STATE_PATH = Path(os.environ.get("XDG_CONFIG_HOME") or "~/.config").expanduser() / "localcode" / "state.json"
+
+
+def load_state():
+    try:
+        return json.loads(STATE_PATH.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(**updates):
+    try:
+        STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        STATE_PATH.write_text(json.dumps({**load_state(), **updates}, indent=2))
+    except OSError:
+        pass  # remembering the model is a convenience; never fail over it
 
 
 def list_models():
-    return [m["name"] for m in ollama("/api/tags").get("models", [])]
+    return sorted(m["name"] for m in ollama("/api/tags").get("models", []))
+
+
+def model_details():
+    """Installed models with size, parameter count, and whether they support tool calling."""
+    details = []
+    for m in sorted(ollama("/api/tags").get("models", []), key=lambda m: m["name"]):
+        try:
+            caps = ollama("/api/show", {"model": m["name"]}).get("capabilities", [])
+        except (urllib.error.URLError, OSError, ValueError):
+            caps = []
+        details.append({"name": m["name"], "size": m.get("size", 0),
+                        "params": m.get("details", {}).get("parameter_size", ""), "tools": "tools" in caps})
+    return details
+
+
+def pick(rows, start=0, title=""):
+    """Arrow-key list picker. Returns the chosen index, or None if cancelled."""
+    if not rows:
+        return None
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        for i, r in enumerate(rows, 1):
+            print(f"  {i}. {r}")
+        try:
+            n = input("Number (blank to cancel): ").strip()
+        except EOFError:
+            return None
+        return int(n) - 1 if n.isdigit() and 1 <= int(n) <= len(rows) else None
+
+    import select
+    import termios
+    import tty
+
+    fd = sys.stdin.fileno()
+    saved = termios.tcgetattr(fd)
+    sel = start if 0 <= start < len(rows) else 0
+    out = sys.stdout
+
+    def draw(first=False):
+        if not first:
+            out.write(f"\033[{len(rows)}A")
+        for i, r in enumerate(rows):
+            out.write("\r\033[K" + (cyan(f"❯ {r}") if i == sel else f"  {r}") + "\n")
+        out.flush()
+
+    print(dim(title))
+    out.write("\033[?25l")
+    result = None
+    try:
+        tty.setcbreak(fd)
+        draw(first=True)
+        while True:
+            ch = os.read(fd, 1)
+            if ch == b"\x1b":
+                if not select.select([fd], [], [], 0.05)[0]:
+                    break  # bare Esc
+                seq = os.read(fd, 2)
+                if seq == b"[A":
+                    sel = (sel - 1) % len(rows)
+                elif seq == b"[B":
+                    sel = (sel + 1) % len(rows)
+            elif ch in (b"\r", b"\n"):
+                result = sel
+                break
+            elif ch == b"k":
+                sel = (sel - 1) % len(rows)
+            elif ch == b"j":
+                sel = (sel + 1) % len(rows)
+            elif ch.isdigit() and 1 <= int(ch) <= len(rows):
+                sel = int(ch) - 1
+            elif ch in (b"q", b"\x03"):
+                break
+            draw()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+        out.write(f"\033[{len(rows) + 1}A\r\033[J\033[?25h")  # erase the picker
+        out.flush()
+    return result
+
+
+def pick_model(current):
+    models = model_details()
+    width = max(len(m["name"]) for m in models) if models else 0
+    rows = [f"{m['name']:<{width}}  {m['params']:>6}  {m['size'] / 1e9:5.1f} GB"
+            + ("  (current)" if m["name"] == current else "")
+            + ("" if m["tools"] else "  · no tool support") for m in models]
+    names = [m["name"] for m in models]
+    i = pick(rows, names.index(current) if current in names else 0,
+             "Select a model  (↑/↓ to move, Enter to choose, Esc to cancel)")
+    return names[i] if i is not None else None
+
+
+def setup_completion():
+    """Tab-complete slash commands and model names after /model."""
+    try:
+        import readline
+    except ImportError:
+        return
+    cache = {}
+
+    def complete(text, state):
+        buf = readline.get_line_buffer()
+        if buf.startswith("/model "):
+            if "models" not in cache:
+                try:
+                    cache["models"] = list_models()
+                except (urllib.error.URLError, OSError):
+                    cache["models"] = []
+            options = [m for m in cache["models"] if m.startswith(text)]
+        elif buf.startswith("/") and " " not in buf:
+            options = [c for c in COMMANDS if c.startswith(text)]
+        else:
+            options = []
+        return options[state] if state < len(options) else None
+
+    readline.set_completer(complete)
+    readline.set_completer_delims(" \t\n")
+    if "libedit" in (readline.__doc__ or ""):
+        readline.parse_and_bind("bind ^I rl_complete")
+    else:
+        readline.parse_and_bind("tab: complete")
 
 
 def read_input():
@@ -606,7 +745,7 @@ def read_input():
 def main():
     ap = argparse.ArgumentParser(description="Coding agent for local Ollama models")
     ap.add_argument("prompt", nargs="*", help="run one task and exit")
-    ap.add_argument("-m", "--model", default=DEFAULT_MODEL)
+    ap.add_argument("-m", "--model", help="model to use (default: last one picked, else " + DEFAULT_MODEL + ")")
     ap.add_argument("-C", "--cwd", default=".", help="project directory")
     ap.add_argument("--yolo", action="store_true", help="auto-approve writes and shell commands")
     args = ap.parse_args()
@@ -615,16 +754,23 @@ def main():
         installed = list_models()
     except (urllib.error.URLError, OSError):
         sys.exit(red(f"Can't reach Ollama at {OLLAMA_HOST}. Start it with `ollama serve`."))
-    if args.model not in installed:
-        sys.exit(red(f"Model {args.model} isn't installed. Installed: {', '.join(installed)}"))
+    if not installed:
+        sys.exit(red(f"No models installed. Try `ollama pull {DEFAULT_MODEL}`."))
+    # -m flag, then LOCALCODE_MODEL, then the model picked last time, then the built-in default
+    model = args.model or os.environ.get("LOCALCODE_MODEL") or load_state().get("model") or DEFAULT_MODEL
+    if model not in installed:
+        if args.prompt or not sys.stdin.isatty():
+            sys.exit(red(f"Model {model} isn't installed. Installed: {', '.join(installed)}"))
+        print(yellow(f"Model {model} isn't installed."))
+        model = pick_model(None)
+        if not model:
+            return
+        save_state(model=model)
 
-    try:
-        import readline  # noqa: F401  (arrow keys and history in input())
-    except ImportError:
-        pass
+    setup_completion()  # also enables arrow keys and history in input()
 
     tools = Tools(args.cwd, auto_approve=args.yolo)
-    agent = Agent(args.model, tools)
+    agent = Agent(model, tools)
 
     if args.prompt:
         agent.run(" ".join(args.prompt))
@@ -649,16 +795,19 @@ def main():
             elif cmd == "/clear":
                 agent.reset()
                 print(dim("Conversation cleared. ") + instructions_status(agent.instructions))
-            elif cmd == "/models":
-                for m in list_models():
-                    print(("* " if m == agent.model else "  ") + m)
-            elif cmd == "/model":
-                if rest.strip():
-                    if rest.strip() in list_models():
-                        agent.model = rest.strip()
-                    else:
-                        print(red("Not installed. Try /models."))
-                print(dim(f"Model: {agent.model}"))
+            elif cmd in ("/model", "/models"):
+                name = rest.strip()
+                if not name:
+                    name = pick_model(agent.model)
+                elif name not in list_models():
+                    print(red(f"{name} isn't installed.") + dim(" Run /model to pick from the installed ones."))
+                    continue
+                if name and name != agent.model:
+                    agent.model = name
+                    save_state(model=name)
+                    print(dim("Switched to ") + bold(name) + dim(". The conversation carries over; /clear to start fresh."))
+                else:
+                    print(dim(f"Model: {agent.model}"))
             elif cmd == "/yolo":
                 tools.auto_approve = not tools.auto_approve
                 print(dim(f"Auto-approve {'on' if tools.auto_approve else 'off'}."))
