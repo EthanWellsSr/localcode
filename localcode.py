@@ -321,9 +321,6 @@ def ollama(path, payload=None, stream=False):
     return (json.loads(line) for line in resp if line.strip())
 
 
-TEXT_CALL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>|```(?:json)?\s*(\{.*?\})\s*```", re.S)
-
-
 XML_CALL_RE = re.compile(r"<function=([\w-]+)>(.*?)</function>", re.S)
 XML_PARAM_RE = re.compile(r"<parameter=([\w-]+)>\n?(.*?)\n?</parameter>", re.S)
 
@@ -339,7 +336,7 @@ def coerce(value):
 def parse_text_tool_calls(text):
     """Fallback for models that print tool calls as text instead of using native tool calls.
 
-    Handles JSON ({"name":..., "arguments":...} bare, in ```json fences or <tool_call> tags)
+    Handles JSON ({"name":..., "arguments":...} anywhere in the text, including fences and <tool_call> tags)
     and the qwen3-coder XML style (<function=name><parameter=k>v</parameter></function>).
     """
     calls = []
@@ -350,15 +347,16 @@ def parse_text_tool_calls(text):
             calls.append({"function": {"name": name, "arguments": args}})
     if calls:
         return calls
-    candidates = [a or b for a, b in TEXT_CALL_RE.findall(text)]
-    stripped = text.strip()
-    if not candidates and stripped.startswith("{") and stripped.endswith("}"):
-        candidates = [stripped]
-    for raw in candidates:
+    # Scan for JSON objects anywhere in the text, so calls after prose or inside fences are found.
+    decoder = json.JSONDecoder()
+    i = text.find("{")
+    while i != -1:
         try:
-            obj = json.loads(raw)
+            obj, end = decoder.raw_decode(text, i)
         except json.JSONDecodeError:
+            i = text.find("{", i + 1)
             continue
+        i = text.find("{", end)
         if isinstance(obj, dict) and obj.get("name") in TOOL_NAMES:
             args = obj.get("arguments", obj.get("parameters", {}))
             if isinstance(args, str):
