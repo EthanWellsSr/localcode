@@ -24,12 +24,14 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import unicodedata
 from pathlib import Path
 
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
 if not OLLAMA_HOST.startswith("http"):
     OLLAMA_HOST = "http://" + OLLAMA_HOST
 DEFAULT_MODEL = "gpt-oss:20b"
+VERSION = "0.1.0"
 NUM_CTX = int(os.environ.get("LOCALCODE_NUM_CTX", "32768"))
 MAX_STEPS = 40
 SHOW_THINKING = os.environ.get("LOCALCODE_SHOW_THINKING") == "1"  # else collapsed to "Thought for Ns"
@@ -109,7 +111,30 @@ BOLD, NOT_BOLD, CODE, NOT_CODE = "\033[1m", "\033[22m", "\033[36m", "\033[39m"
 
 
 def visible_len(s):
-    return len(ANSI_RE.sub("", s))
+    return sum(char_width(ch) for ch in ANSI_RE.sub("", s))
+
+
+def char_width(ch):
+    """Terminal cells for ordinary text, including CJK and combining accents."""
+    if unicodedata.category(ch) in ("Mn", "Me", "Cf", "Cc"):
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+
+def clip_ansi(text, width):
+    """Clip without wrapping, preserving complete color escapes."""
+    out, used = [], 0
+    for tok in re.findall(r"\x1b\[[0-9;]*m|.", text):
+        cells = 0 if tok.startswith("\x1b") else char_width(tok)
+        if used + cells > max(0, width):
+            break
+        out.append(tok)
+        used += cells
+    return "".join(out)
+
+
+def abbreviate(text, width):
+    return text if visible_len(text) <= width else clip_ansi(text, max(0, width - 1)) + ("…" if width else "")
 
 
 def render_inline(s):
@@ -124,7 +149,7 @@ def wrap_ansi(s, width):
     for tok in re.findall(r"\x1b\[[0-9;]*m|.", s) + [" "]:
         if tok != " ":
             word += tok
-            wvis += 0 if tok.startswith("\x1b") else 1
+            wvis += 0 if tok.startswith("\x1b") else char_width(tok)
             continue
         if not word:
             continue
@@ -411,7 +436,7 @@ class Tools:
             return True
         print(yellow(f"  allow {tool}? ") + summary)
         try:
-            question = yellow("  [y]es / [n]o / [a]lways: ")
+            question = yellow("  [Y]es / [n]o / [a]lways for this tool: ")
             ask = getattr(sys.stdout, "ask", None)  # full-window mode records the prompt and answer
             ans = ask(question) if ask else input(prompt(question))
         except EOFError:
@@ -656,7 +681,7 @@ def find_instructions(root):
 def instructions_status(path):
     if path:
         return green(f"✓ {path.name} found and ingested")
-    return dim("✗ no AGENTS.md found")
+    return dim("No project instructions · add AGENTS.md to guide your agent")
 
 
 # ---------------------------------------------------------------- model client
@@ -820,6 +845,7 @@ class Agent:
 
 COMMANDS = {
     "/model": "pick a model, or /model <name> to switch straight to one",
+    "/status": "show model, workspace, context, and approvals",
     "/clear": "start a fresh conversation",
     "/yolo": "toggle auto-approve for writes and commands",
     "/help": "show commands and keys",
@@ -830,6 +856,8 @@ HELP = "Commands:\n" + "\n".join(f"  {c:<8} {d}" for c, d in COMMANDS.items()) +
 Keys:
   /          suggest commands (↑/↓ to choose, Tab to complete, Enter to run, Esc to close)
   ↑/↓        step through past entries
+  PgUp/PgDn  scroll the conversation (mouse wheel also works)
+  Ctrl-D     quit on an empty line
   \\ + Enter  start a new line
   Ctrl-C     clear the line; on an empty line, quit"""
 STATE_PATH = Path(os.environ.get("XDG_CONFIG_HOME") or "~/.config").expanduser() / "localcode" / "state.json"
@@ -1031,36 +1059,61 @@ def short_path(p):
     return "~" + p[len(home):] if p == home or p.startswith(home + os.sep) else p
 
 
-BIG = {  # 3-row block letters for the banner
-    "L": ["█   ", "█   ", "▀▀▀▀"], "O": ["█▀▀█", "█  █", "▀▀▀▀"], "C": ["█▀▀▀", "█   ", "▀▀▀▀"],
-    "A": ["█▀▀█", "█▀▀█", "▀  ▀"], "D": ["█▀▀▄", "█  █", "▀▀▀ "], "E": ["█▀▀▀", "█▀▀ ", "▀▀▀▀"],
-}
-PLACEHOLDER = "Ask anything, or type / for commands"
+PLACEHOLDER = "Ask about this project…  / commands"
 EDITOR_HISTORY_PATH = STATE_PATH.parent / "history.jsonl"
 
 
 def header_lines(agent, width, height):
-    """The pinned banner: big LOCALCODE lettering when there's room, else a single line."""
-    info = dim(f"{agent.model} · Ollama · {short_path(agent.tools.root)}")
-    if width >= 50 and height >= 24:
-        big = [cyan(" ".join(BIG[ch][r] for ch in "LOCALCODE")) for r in range(3)]
-        return ["", *big, "", info, instructions_status(agent.instructions), ""]
-    return [bold("localcode") + "  " + info, ""]
+    """Keep the identity visible without spending the conversation's screen space."""
+    title = "  " + cyan("◆") + " " + bold("localcode") + dim("  /  Ollama")
+    if height < 16:
+        return [title]
+    project = abbreviate(short_path(agent.tools.root), max(1, width - 4))
+    return [title, "  " + dim(project), ""]
+
+
+def welcome_lines(agent):
+    return [bold("Your project. Your models."),
+            dim("Start with a task, or explore before making changes."), "",
+            cyan("  ❯ ") + "Explain how this project works",
+            cyan("  ❯ ") + "Find the cause of a bug and propose a fix", "",
+            dim("/model") + " choose a model   " + dim("/help") + " keys and commands",
+            instructions_status(agent.instructions)]
+
+
+def show_status(agent):
+    """Local session details; never sends a request to the model."""
+    pct = round(100 * agent.ctx_used / NUM_CTX) if NUM_CTX else 0
+    print(bold("Session"))
+    for label, value in [
+        ("Model", agent.model), ("Ollama", OLLAMA_HOST),
+        ("Workspace", str(agent.tools.root)),
+        ("Instructions", str(agent.instructions) if agent.instructions else "No project instructions"),
+        ("Context", f"{fmt_tokens(agent.ctx_used)} / {fmt_tokens(NUM_CTX)} ({pct}%)"),
+        ("Approvals", "Auto-approve" if agent.tools.auto_approve else "Ask before writes and commands"),
+        ("Allowed this session", ", ".join(sorted(agent.tools.always)) or "None"),
+    ]:
+        print("  " + dim(f"{label:<21}") + value)
+    if agent.last_speed:
+        print("  " + dim(f"{'Last reply':<21}") + f"{agent.last_speed:.1f} tok/s")
 
 
 def hard_wrap(line, width):
     """Split a line (with color codes) into terminal rows exactly as the terminal would wrap it."""
+    width = max(1, width)
     rows, row, vis, active = [], "", 0, ""
     for tok in re.findall(r"\x1b\[[0-9;]*m|.", line):
         if tok.startswith("\x1b"):
             row += tok
             active = "" if tok in ("\x1b[0m", "\x1b[m") else active + tok
             continue
-        if vis == width:
+        cells = char_width(tok)
+        if vis and vis + cells > width:
             rows.append(row + "\x1b[0m")
             row, vis = active, 0
-        row += tok
-        vis += 1
+        if cells <= width:
+            row += tok
+            vis += cells
     rows.append(row)
     return rows
 
@@ -1129,8 +1182,16 @@ class Transcript:
 def load_editor_history():
     """One JSON string per line. On first run, import the old readline history file."""
     try:
-        return [json.loads(l) for l in EDITOR_HISTORY_PATH.read_text().splitlines() if l.strip()][-HISTORY_LENGTH:]
-    except (OSError, ValueError):
+        entries = []
+        for line in EDITOR_HISTORY_PATH.read_text().splitlines():
+            try:
+                value = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(value, str):
+                entries.append(value)
+        return entries[-HISTORY_LENGTH:]
+    except OSError:
         pass
     try:
         lines = HISTORY_PATH.read_text().splitlines()
@@ -1157,8 +1218,9 @@ class Screen:
     MIN_ROWS = 12
     MAX_MENU = 8
 
-    def __init__(self, agent):
+    def __init__(self, agent, plain=False):
         self.agent = agent
+        self.plain = plain
         self.active = False
         self.reading = False  # True while read_line() owns the prompt row
         self.extra = 0        # rows the box has grown upward for the menu
@@ -1166,11 +1228,12 @@ class Screen:
         self.gap = False      # print a blank line before the next echoed message
         self.history = []
         self.models = None    # installed model names, fetched when the /model menu first needs them
+        self.resize_handler = None
 
     # ---- layout
 
     def start(self):
-        if not (USE_COLOR and sys.stdin.isatty()) or shutil.get_terminal_size().lines < self.MIN_ROWS:
+        if self.plain or not (USE_COLOR and sys.stdin.isatty()) or shutil.get_terminal_size().lines < self.MIN_ROWS:
             return
         self.active = True
         self.history = load_editor_history()
@@ -1179,7 +1242,7 @@ class Screen:
         atexit.register(self.stop)
         try:
             import signal
-            signal.signal(signal.SIGWINCH, lambda *_: self.on_resize())
+            self.resize_handler = signal.signal(signal.SIGWINCH, lambda *_: self.on_resize())
         except (ImportError, AttributeError, ValueError):
             pass
         # Alternate screen (the earlier terminal output stays out of view and comes back on exit),
@@ -1189,9 +1252,10 @@ class Screen:
 
     def _layout(self):
         size = shutil.get_terminal_size()
-        self.w, self.h = size.columns, size.lines
+        self.w, self.h = max(1, size.columns), max(1, size.lines)
         self.header = header_lines(self.agent, self.w, self.h)
         self.top = len(self.header)
+        self.extra = min(self.extra, max(0, self.h - self.FRAME - self.top - 3))
         self.bottom = self.h - self.FRAME - self.extra
 
     def _w(self, s):
@@ -1200,24 +1264,32 @@ class Screen:
 
     def draw_header(self):
         self._layout()
+        if self.too_small():
+            return
         out = "\0337"
         for row, line in enumerate(self.header, 1):
-            pad = " " * max(0, (self.w - visible_len(line)) // 2)
-            out += f"\033[{row};1H\033[2K" + self.fit(pad + line)
+            out += f"\033[{row};1H\033[2K" + self.fit(line)
         self._w(out + "\0338")
 
     def redraw_all(self):
         """Redraw everything: banner, the conversation (from the kept copy) and the input box."""
         self._layout()
+        if self.too_small():
+            self._w("\033[r\033[2J\033[H" + clip_ansi("Resize to continue", self.w))
+            return
         self._w("\033[2J" + f"\033[{self.top + 1};{self.bottom}r")
         self.draw_header()
         self.render_view()
         self.draw_frame()
 
+    def too_small(self):
+        return self.h < 8 or self.w < 8
+
     def clear_conversation(self):
         self.rec.clear()
         self.offset, self.gap = 0, False
         self.redraw_all()
+        print("\n".join(welcome_lines(self.agent)))
 
     def on_resize(self):
         if not self.active:
@@ -1228,6 +1300,8 @@ class Screen:
 
     def grow(self, n):
         """Make the box n rows taller than normal (for the menu); the conversation view shrinks to fit."""
+        if self.too_small():
+            return
         n = max(0, min(n, self.h - self.FRAME - self.top - 3))
         if n == self.extra:
             return
@@ -1242,6 +1316,8 @@ class Screen:
         When showing the newest output (and not at the prompt), leaves the cursor where the
         next output goes, so streaming continues exactly where the copy ends.
         """
+        if self.too_small():
+            return
         height = self.bottom - self.top
         rows = []
         for line in reversed(self.rec.lines + [self.rec.cur]):
@@ -1267,25 +1343,31 @@ class Screen:
         used = a.ctx_used
         pct = round(100 * used / NUM_CTX) if NUM_CTX else 0
         color = green if pct < 50 else yellow if pct < 80 else red
-        parts = [a.model, short_path(a.tools.root),
-                 "Context: " + color(f"{fmt_tokens(used)} / {fmt_tokens(NUM_CTX)} ({pct}%)") + DIM_ON]
-        if a.last_speed:
+        approvals = yellow("auto-approve") if a.tools.auto_approve else green("ask to edit")
+        model = abbreviate(a.model, max(4, self.w // 3))
+        parts = [model, approvals, color(f"ctx {pct}%")]
+        if self.w >= 80:
+            filled = min(8, max(0, round(pct * 8 / 100)))
+            parts[-1] = color("▰" * filled + "▱" * (8 - filled) + f" {pct}% context")
+        if a.last_speed and self.w >= 60:
             parts.append(f"{a.last_speed:.1f} tok/s")
-        return dim("  " + "  |  ".join(parts))
+        return "  " + dim(" · ").join(parts)
 
     def hint_text(self):
         if self.offset:
             return "  " + cyan(f"↑ scrolled back {self.offset} lines") + dim(" · scroll down or PgDn to return")
         if self.agent.tools.auto_approve:
             return "  " + yellow("⏵⏵ auto-approve on") + dim(" (/yolo to turn off)")
-        return dim("  ? /help for commands · /model to switch models · scroll or PgUp to look back")
+        return dim("  / commands · ↑↓ history · PgUp scroll · Ctrl-C clear / quit")
 
     def fit(self, line):
         """Cut a line to the window width; a line that wraps would spill into the rows below it."""
-        return hard_wrap(line, self.w)[0] + "\033[0m"
+        return clip_ansi(line, self.w) + "\033[0m"
 
     def draw_frame(self, save=True, below=None):
         """Draw the rules and the rows under the prompt (status + hint, or the menu rows passed in)."""
+        if self.too_small():
+            return
         rule = dim("─" * self.w)
         row = self.bottom + 1
         below = below if below is not None else [self.status_text(), self.hint_text()]
@@ -1319,6 +1401,8 @@ class Screen:
 
     def render(self):
         items = self.menu_items()
+        if self.too_small():
+            return items
         self.sel = min(self.sel, max(0, len(items) - 1))
         self.grow(max(0, len(items) - 2))
         if items:
@@ -1330,14 +1414,17 @@ class Screen:
         self.draw_frame(save=False, below=below)
         # The prompt row: scroll horizontally so the cursor stays visible; show newlines as ↵.
         shown = self.text().replace("\n", "↵")
-        avail = max(10, self.w - 3)
-        start = max(0, self.pos - avail)
+        avail = max(0, self.w - 3)
+        start = self.pos
+        while start and visible_len(shown[start - 1:self.pos]) <= avail:
+            start -= 1
         row = self.bottom + 2
         if shown:
-            line = cyan("❯ ") + shown[start:start + avail]
+            line = cyan("❯ ") + clip_ansi(shown[start:], avail)
         else:
             line = cyan("❯ ") + dim(PLACEHOLDER)
-        self._w(f"\033[{row};1H\033[2K" + line + f"\033[{row};{3 + self.pos - start}H")
+        cursor = min(self.w, 3 + visible_len(shown[start:self.pos]))
+        self._w(f"\033[{row};1H\033[2K" + self.fit(line) + f"\033[{row};{cursor}H")
         return items
 
     def read_line(self):
@@ -1355,6 +1442,7 @@ class Screen:
         decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
 
         self.buf, self.pos, self.sel, self.menu_closed, self.in_paste = [], 0, 0, False, False
+        self.models = None  # refresh installed model suggestions for each new entry
         hist_i, draft = len(self.history), ""
         self._w("\033[?2004h")  # bracketed paste, so multi-line pastes arrive as one piece
         self.reading = True
@@ -1364,13 +1452,32 @@ class Screen:
         try:
             items = self.render()
             while result is None:
-                data = pending + decoder.decode(os.read(fd, 4096))
+                chunk = os.read(fd, 4096)
+                if not chunk:
+                    result = EOFError()
+                    break
+                data = pending + decoder.decode(chunk)
                 pending = ""
                 if data == "\x1b" and select.select([fd], [], [], 0.03)[0]:
                     pending = data  # the rest of an escape sequence is on its way
                     continue
                 i = 0
                 while i < len(data) and result is None:
+                    # Escape sequences and paste delimiters can span arbitrary reads.
+                    tail = data[i:]
+                    if self.in_paste:
+                        marker = "\x1b[201~"
+                        if marker not in tail:
+                            keep = next((n for n in range(min(len(tail), len(marker) - 1), 0, -1)
+                                         if tail.endswith(marker[:n])), 0)
+                            if keep:
+                                pending = tail[-keep:]
+                                data = data[:-keep]
+                                if i == len(data):
+                                    break
+                    elif tail.startswith("\x1b[") and not re.search(r"[@-~]", tail[2:]):
+                        pending = tail
+                        break
                     key, i = self._next_key(data, i)
                     if key in self.SCROLL_KEYS:
                         self.scroll(self.SCROLL_KEYS[key] * (max(1, self.bottom - self.top - 2) if key.startswith("page") else 1))
@@ -1537,6 +1644,10 @@ class Screen:
             return
         self.active = False
         sys.stdout = self.raw
+        if self.resize_handler is not None:
+            import signal
+            signal.signal(signal.SIGWINCH, self.resize_handler)
+            self.resize_handler = None
         try:
             EDITOR_HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
             EDITOR_HISTORY_PATH.write_text("".join(json.dumps(h) + "\n" for h in self.history[-HISTORY_LENGTH:]))
@@ -1552,12 +1663,19 @@ def main():
     ap.add_argument("-m", "--model", help="model to use (default: last one picked, else " + DEFAULT_MODEL + ")")
     ap.add_argument("-C", "--cwd", default=".", help="project directory")
     ap.add_argument("--yolo", action="store_true", help="auto-approve writes and shell commands")
+    ap.add_argument("--plain", action="store_true", help="use inline prompts instead of the full-screen interface")
+    ap.add_argument("--version", action="version", version="%(prog)s " + VERSION)
     args = ap.parse_args()
+    root = Path(args.cwd).expanduser().resolve()
+    if not root.is_dir():
+        ap.error(f"project directory does not exist or is not a directory: {root}")
 
     try:
         installed = list_models()
     except (urllib.error.URLError, OSError):
-        sys.exit(red(f"Can't reach Ollama at {OLLAMA_HOST}. Start it with `ollama serve`."))
+        sys.exit(red(f"Can't reach Ollama at {OLLAMA_HOST}.") +
+                 "\nOpen the Ollama app on your Mac, or run `ollama serve`." +
+                 "\nFor another server, set OLLAMA_HOST to its address.")
     if not installed:
         sys.exit(red(f"No models installed. Try `ollama pull {DEFAULT_MODEL}`."))
     # -m flag, then LOCALCODE_MODEL, then the model picked last time, then the built-in default
@@ -1571,69 +1689,79 @@ def main():
             return
         save_state(model=model)
 
-    tools = Tools(args.cwd, auto_approve=args.yolo)
+    tools = Tools(root, auto_approve=args.yolo)
     agent = Agent(model, tools)
 
     if args.prompt:
         agent.run(" ".join(args.prompt))
         return
 
-    screen = Screen(agent)
-    screen.start()
-    agent.show_stats = not screen.active  # the status line shows them instead
-    if not screen.active:
-        setup_readline()  # plain-prompt fallback: readline's editing and history
-        print(bold("localcode") + dim(f"  {agent.model}  ·  {tools.root}  ·  /help for commands"))
-        print(instructions_status(agent.instructions))
-    while True:
-        try:
-            text = read_input(screen)
-        except (EOFError, KeyboardInterrupt):
-            print()
-            return
-        if not text:
-            continue
-        if screen.active:
-            print()
-        if text.startswith("/"):
-            cmd, _, rest = text.partition(" ")
-            if cmd in ("/exit", "/quit"):
+    screen = Screen(agent, plain=args.plain)
+    try:
+        screen.start()
+        agent.show_stats = not screen.active  # the status line shows them instead
+        if not screen.active:
+            setup_readline()  # plain-prompt fallback: readline's editing and history
+            print(bold("localcode") + dim(f"  {agent.model}  ·  {tools.root}  ·  /help for commands"))
+        print("\n".join(welcome_lines(agent)))
+        while True:
+            try:
+                text = read_input(screen)
+            except (EOFError, KeyboardInterrupt):
+                print()
                 return
-            elif cmd == "/help":
-                print(HELP)
-            elif cmd == "/clear":
-                agent.reset()
-                if screen.active:
-                    screen.clear_conversation()
-                else:
-                    print(dim("Conversation cleared. ") + instructions_status(agent.instructions))
-            elif cmd in ("/model", "/models"):
-                name = rest.strip()
-                if not name:
-                    name = pick_model(agent.model)
-                elif name not in list_models():
-                    print(red(f"{name} isn't installed.") + dim(" Run /model to pick from the installed ones."))
+            if not text:
+                continue
+            if screen.active:
+                print()
+            try:
+                if text.startswith("/"):
+                    cmd, _, rest = text.partition(" ")
+                    if cmd in ("/exit", "/quit"):
+                        return
+                    elif cmd == "/help":
+                        print(HELP)
+                    elif cmd == "/status":
+                        show_status(agent)
+                    elif cmd == "/clear":
+                        agent.reset()
+                        if screen.active:
+                            screen.clear_conversation()
+                        else:
+                            print(dim("Conversation cleared. ") + instructions_status(agent.instructions))
+                    elif cmd in ("/model", "/models"):
+                        name = rest.strip()
+                        if not name:
+                            name = pick_model(agent.model)
+                        elif name not in list_models():
+                            print(red(f"{name} isn't installed.") + dim(" Run /model to pick from the installed ones."))
+                            continue
+                        if name and name != agent.model:
+                            agent.model = name
+                            save_state(model=name)
+                            if screen.active:
+                                screen.draw_header()
+                            print(dim("Switched to ") + bold(name) + dim(". The conversation carries over; /clear to start fresh."))
+                        else:
+                            print(dim(f"Model: {agent.model}"))
+                    elif cmd == "/yolo":
+                        tools.auto_approve = not tools.auto_approve
+                        print(dim(f"Auto-approve {'on' if tools.auto_approve else 'off'}."))
+                    else:
+                        print(red("Unknown command.") + " " + HELP)
                     continue
-                if name and name != agent.model:
-                    agent.model = name
-                    save_state(model=name)
-                    if screen.active:
-                        screen.draw_header()
-                    print(dim("Switched to ") + bold(name) + dim(". The conversation carries over; /clear to start fresh."))
-                else:
-                    print(dim(f"Model: {agent.model}"))
-            elif cmd == "/yolo":
-                tools.auto_approve = not tools.auto_approve
-                print(dim(f"Auto-approve {'on' if tools.auto_approve else 'off'}."))
-            else:
-                print(red("Unknown command.") + " " + HELP)
-            continue
-        try:
-            agent.run(text)
-        except KeyboardInterrupt:
-            print(yellow("\nInterrupted."))
-        except (urllib.error.URLError, RuntimeError) as e:
-            print(red(f"Model error: {e}"))
+            except (urllib.error.URLError, OSError, ValueError) as e:
+                print(red(f"Command failed: {e}") + dim(" Try again, or /exit to quit."))
+                continue
+            try:
+                agent.run(text)
+            except KeyboardInterrupt:
+                print(yellow("\nInterrupted."))
+            except (urllib.error.URLError, RuntimeError) as e:
+                print(red(f"Model error: {e}"))
+
+    finally:
+        screen.stop()
 
 
 if __name__ == "__main__":
