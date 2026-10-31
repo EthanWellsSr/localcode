@@ -48,7 +48,7 @@ Replies are rendered as Markdown while they stream: headings and **bold** in bol
 | `/yolo` | Toggle auto-approve for writes and commands |
 | `/help`, `/exit` | |
 
-End a line with `\` to keep typing on the next line. The model you pick is remembered for next time (in `~/.config/localcode/state.json`); switching keeps the conversation.
+↑/↓ step through your past entries, like a shell; history is saved across sessions in `~/.config/localcode/history` (approval answers and immediate repeats are left out). End a line with `\` to keep typing on the next line. The model you pick is remembered for next time (in `~/.config/localcode/state.json`); switching keeps the conversation.
 
 ## Settings
 

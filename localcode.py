@@ -11,6 +11,7 @@ back to parsing JSON tool calls out of plain text for models that do that.
 """
 
 import argparse
+import atexit
 import difflib
 import fnmatch
 import json
@@ -402,6 +403,8 @@ class Tools:
             ans = input(prompt(yellow("  [y]es / [n]o / [a]lways: "))).strip().lower()
         except EOFError:
             return False
+        if ans:
+            drop_last_history()  # keep y/n answers out of the up-arrow history
         if ans in ("a", "always"):
             self.always.add(tool)
             return True
@@ -916,12 +919,41 @@ def pick_model(current):
     return names[i] if i is not None else None
 
 
-def setup_completion():
-    """Tab-complete slash commands and model names after /model."""
+HISTORY_PATH = STATE_PATH.parent / "history"
+HISTORY_LENGTH = 1000
+
+
+def drop_last_history(only_if_duplicate=False):
+    """Remove the newest history entry (approval answers), or just a repeat of the one before it."""
+    try:
+        import readline
+        n = readline.get_current_history_length()
+        if n and (not only_if_duplicate or (n > 1 and readline.get_history_item(n) == readline.get_history_item(n - 1))):
+            readline.remove_history_item(n - 1)
+    except (ImportError, ValueError):
+        pass
+
+
+def setup_readline():
+    """Up/down history saved across sessions, plus Tab-completion of slash commands and model names."""
     try:
         import readline
     except ImportError:
         return
+    try:
+        readline.read_history_file(HISTORY_PATH)
+    except OSError:
+        pass
+    readline.set_history_length(HISTORY_LENGTH)
+
+    def save_history():
+        try:
+            HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+            readline.write_history_file(HISTORY_PATH)
+        except OSError:
+            pass
+
+    atexit.register(save_history)
     cache = {}
 
     def complete(text, state):
@@ -951,6 +983,7 @@ def read_input():
     lines = []
     while True:
         line = input(prompt(bold("> ")) if not lines else "  ")
+        drop_last_history(only_if_duplicate=True)  # like a shell, don't store the same line twice in a row
         if line.endswith("\\"):
             lines.append(line[:-1])
             continue
@@ -983,7 +1016,7 @@ def main():
             return
         save_state(model=model)
 
-    setup_completion()  # also enables arrow keys and history in input()
+    setup_readline()
 
     tools = Tools(args.cwd, auto_approve=args.yolo)
     agent = Agent(model, tools)
