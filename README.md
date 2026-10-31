@@ -2,14 +2,28 @@
 
 A small opencode-style coding agent for local models running in [Ollama](https://ollama.com). One Python file, standard library only.
 
+## Install
+
+Needs Python 3.9+ and [Ollama](https://ollama.com).
+
+```bash
+git clone https://github.com/EthanWellsSr/localcode.git
+cd localcode
+pip3 install -e .
+```
+
+That adds a `localcode` command you can run from any folder. `-e` keeps it pointed at the clone, so `git pull` updates it with no reinstall. To remove it: `pip3 uninstall localcode`.
+
+If your shell can't find `localcode` after installing, pip's script folder isn't on your PATH; `python3 -m pip show -f localcode` shows where it went.
+
 ## Run
 
 ```bash
 ollama serve                     # if Ollama isn't already running
-python3 localcode.py             # interactive, works in the current directory
-python3 localcode.py -C ~/code/myproject
-python3 localcode.py "fix the failing tests"   # one-shot
-python3 localcode.py -m qwen3-coder:30b        # pick a model
+localcode                        # interactive, works in the current directory
+localcode -C ~/code/myproject
+localcode "fix the failing tests"   # one-shot
+localcode -m qwen3-coder:30b        # pick a model
 ```
 
 ## Tools the model gets
