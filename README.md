@@ -36,21 +36,30 @@ Writes, edits and shell commands show a diff or the command and ask before runni
 
 ## Output
 
-localcode takes over the terminal window: the header sits at the top, the conversation scrolls in the middle, and the input box stays pinned to the bottom with a status line under it showing the model, the folder, how much of the context window is used, and the last reply's speed. Reasoning models' thinking is collapsed to a single "✻ Thought for Ns" line (set `LOCALCODE_SHOW_THINKING=1` to see it). When you quit, the input box is cleared and your shell prompt picks up right under the conversation.
+localcode takes over the terminal window: the header sits centered at the top, the conversation scrolls in the middle, and the input box stays pinned to the bottom with a status line under it showing the model, the folder, how much of the context window is used, and the last reply's speed. Reasoning models' thinking is collapsed to a single "✻ Thought for Ns" line (set `LOCALCODE_SHOW_THINKING=1` to see it). When you quit, localcode clears the window and hands it back.
 
 Replies are rendered as Markdown while they stream: headings and **bold** in bold, `code` in color, bullets as •, code blocks with a side bar, and tables drawn as aligned boxes that fit the terminal width. When output is piped instead of shown in a terminal, the raw Markdown is passed through.
 
-## REPL commands
+## Commands and keys
+
+Type `/` and a menu of commands appears under the input: ↑/↓ to choose, Tab to complete, Enter to run, Esc to close. After `/model ` it suggests your installed models.
 
 | Command | |
 | --- | --- |
-| `/model` | Open the model picker: ↑/↓ (or j/k) to move, Enter to choose, Esc to cancel |
-| `/model <name>` | Switch straight to a model; Tab completes names |
+| `/model` | Open the model picker, or `/model <name>` to switch straight to one |
 | `/clear` | Start a fresh conversation (re-reads `AGENTS.md`) |
 | `/yolo` | Toggle auto-approve for writes and commands |
-| `/help`, `/exit` | |
+| `/help` | Show commands and keys |
+| `/exit` | Quit |
 
-↑/↓ step through your past entries, like a shell; history is saved across sessions in `~/.config/localcode/history` (approval answers and immediate repeats are left out). End a line with `\` to keep typing on the next line. The model you pick is remembered for next time (in `~/.config/localcode/state.json`); switching keeps the conversation.
+| Key | |
+| --- | --- |
+| ↑/↓ | Step through past entries (saved across sessions in `~/.config/localcode/history.jsonl`) |
+| `\` then Enter | Start a new line; pasting multi-line text also works |
+| Ctrl-C | Clear the line; on an empty line, quit |
+| Ctrl-A / Ctrl-E, Ctrl-U / Ctrl-K, Ctrl-W | Start/end of line, delete to start/end, delete word |
+
+The model you pick is remembered for next time (in `~/.config/localcode/state.json`); switching keeps the conversation.
 
 ## Settings
 

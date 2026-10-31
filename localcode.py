@@ -29,7 +29,6 @@ from pathlib import Path
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
 if not OLLAMA_HOST.startswith("http"):
     OLLAMA_HOST = "http://" + OLLAMA_HOST
-__version__ = "0.1.0"
 DEFAULT_MODEL = "gpt-oss:20b"
 NUM_CTX = int(os.environ.get("LOCALCODE_NUM_CTX", "32768"))
 MAX_STEPS = 40
@@ -809,14 +808,20 @@ class Agent:
 
 # ---------------------------------------------------------------- REPL
 
-HELP = """Commands:
-  /model          pick a model (↑/↓ or j/k, Enter to choose, Esc to cancel)
-  /model <name>   switch straight to a model (Tab completes names)
-  /clear          start a fresh conversation
-  /yolo           toggle auto-approve for writes and commands
-  /exit           quit
-End a line with \\ to continue on the next line."""
-COMMANDS = ["/model", "/clear", "/yolo", "/help", "/exit"]
+COMMANDS = {
+    "/model": "pick a model, or /model <name> to switch straight to one",
+    "/clear": "start a fresh conversation",
+    "/yolo": "toggle auto-approve for writes and commands",
+    "/help": "show commands and keys",
+    "/exit": "quit localcode",
+}
+HELP = "Commands:\n" + "\n".join(f"  {c:<8} {d}" for c, d in COMMANDS.items()) + """
+
+Keys:
+  /          suggest commands (↑/↓ to choose, Tab to complete, Enter to run, Esc to close)
+  ↑/↓        step through past entries
+  \\ + Enter  start a new line
+  Ctrl-C     clear the line; on an empty line, quit"""
 STATE_PATH = Path(os.environ.get("XDG_CONFIG_HOME") or "~/.config").expanduser() / "localcode" / "state.json"
 
 
@@ -936,12 +941,14 @@ HISTORY_LENGTH = 1000
 
 def drop_last_history(only_if_duplicate=False):
     """Remove the newest history entry (approval answers), or just a repeat of the one before it."""
+    readline = sys.modules.get("readline")  # only in the plain-prompt fallback; the full-window editor has its own
+    if readline is None:
+        return
     try:
-        import readline
         n = readline.get_current_history_length()
         if n and (not only_if_duplicate or (n > 1 and readline.get_history_item(n) == readline.get_history_item(n - 1))):
             readline.remove_history_item(n - 1)
-    except (ImportError, ValueError):
+    except ValueError:
         pass
 
 
@@ -991,13 +998,11 @@ def setup_readline():
 
 
 def read_input(screen=None):
+    if screen and screen.active:
+        return screen.read_line().strip()
     lines = []
     while True:
-        marker = "❯ " if not lines else "… "
-        if screen and screen.active:
-            line = screen.read_line(prompt(cyan(marker)))
-        else:
-            line = input(prompt(bold(marker)))
+        line = input(prompt(bold("❯ " if not lines else "… ")))
         drop_last_history(only_if_duplicate=True)  # like a shell, don't store the same line twice in a row
         if line.endswith("\\"):
             lines.append(line[:-1])
@@ -1017,36 +1022,60 @@ def short_path(p):
 
 
 ICON = ["▛▀▀▀▀▀▜", "▌ >_  ▐", "▙▄▄▄▄▄▟"]
+PLACEHOLDER = "Ask anything, or type / for commands"
+EDITOR_HISTORY_PATH = STATE_PATH.parent / "history.jsonl"
 
 
 def header_lines(agent):
-    info = [bold("localcode") + dim(f" v{__version__}"),
-            dim(f"{agent.model} · Ollama"),
-            dim(short_path(agent.tools.root))]
+    info = [bold("localcode"), dim(f"{agent.model} · Ollama"), dim(short_path(agent.tools.root))]
     return [cyan(icon) + "   " + text for icon, text in zip(ICON, info)]
+
+
+def load_editor_history():
+    """One JSON string per line. On first run, import the old readline history file."""
+    try:
+        return [json.loads(l) for l in EDITOR_HISTORY_PATH.read_text().splitlines() if l.strip()][-HISTORY_LENGTH:]
+    except (OSError, ValueError):
+        pass
+    try:
+        lines = HISTORY_PATH.read_text().splitlines()
+    except OSError:
+        return []
+    if lines and lines[0] == "_HiStOrY_V2_":  # libedit escapes spaces and backslashes
+        lines = [l.replace("\\040", " ").replace("\\\\", "\\") for l in lines[1:]]
+    return [l for l in lines if l][-HISTORY_LENGTH:]
 
 
 class Screen:
     """Full-window layout: the conversation scrolls above, the input box and status stay pinned below.
 
-    Uses a terminal scroll region (rows 1..bottom) for the transcript; the last FRAME rows hold
-    a rule, the prompt line, a rule, the status line and a hint line. Falls back to plain inline
-    prompts when the output isn't a terminal or the window is too small.
+    The transcript lives in a terminal scroll region (rows 1..bottom). Below it: a rule, the
+    prompt row, a rule, then two rows for the status and hint lines. While the / menu is open
+    those two rows show suggestions instead, and the box grows upward if it needs more room.
+    Input is read by a small raw-mode line editor (not readline) so the menu can update per key.
+    Falls back to plain inline prompts when the output isn't a terminal or the window is too small.
     """
 
     FRAME = 5
     MIN_ROWS = 12
+    MAX_MENU = 8
 
     def __init__(self, agent):
         self.agent = agent
         self.active = False
-        self.reading = False  # True while input() is waiting in the prompt row
-        self.marker = ""
+        self.reading = False  # True while read_line() owns the prompt row
+        self.extra = 0        # rows the box has grown upward for the menu
+        self.shift = 0        # rows the transcript scrolled up since its cursor position was saved
+        self.history = []
+        self.models = None    # installed model names, fetched when the /model menu first needs them
+
+    # ---- layout
 
     def start(self):
         if not (USE_COLOR and sys.stdin.isatty()) or shutil.get_terminal_size().lines < self.MIN_ROWS:
             return
         self.active = True
+        self.history = load_editor_history()
         atexit.register(self.stop)
         try:
             import signal
@@ -1058,21 +1087,26 @@ class Screen:
     def _layout(self):
         size = shutil.get_terminal_size()
         self.w, self.h = size.columns, size.lines
-        self.bottom = self.h - self.FRAME
+        self.bottom = self.h - self.FRAME - self.extra
 
     def _w(self, s):
         sys.stdout.write(s)
         sys.stdout.flush()
 
+    def _centered(self, lines):
+        pad = " " * max(0, (self.w - max(visible_len(l) for l in lines)) // 2)
+        for line in lines:
+            print(pad + line)
+
     def redraw_all(self):
-        """Clear the window, then draw the header at the top and the input frame at the bottom."""
+        """Clear the window, then draw the header centered at the top and the input box at the bottom."""
+        self.extra = 0
         self._layout()
         self._w("\033[2J" + f"\033[1;{self.bottom}r" + "\033[H")
         print()
-        for line in header_lines(self.agent):
-            print("  " + line)
+        self._centered(header_lines(self.agent))
         print()
-        print("  " + instructions_status(self.agent.instructions))
+        self._centered([instructions_status(self.agent.instructions)])
         print()
         self.gap = False  # the header already ends with a blank line
         self.draw_frame()
@@ -1081,22 +1115,30 @@ class Screen:
         if not self.active:
             return
         self._layout()
-        if not self.reading:
+        if self.reading:
+            # The saved cursor slot holds the transcript position, so don't touch it; just redraw the box.
+            self._w(f"\033[1;{self.bottom}r")
+            self.render()
+        else:
             # Setting the scroll region homes the cursor, so keep the transcript position around it.
             self._w("\0337" + f"\033[1;{self.bottom}r" + "\0338")
             self.draw_frame()
+
+    def grow(self, n):
+        """Make the box n rows taller than normal (for the menu), scrolling the transcript up to make room."""
+        n = max(0, min(n, self.h - self.FRAME - 3))
+        if n > self.extra:
+            d = n - self.extra
+            self._w(f"\033[{self.bottom};1H" + "\n" * d)
+            self.shift += d
+        elif n < self.extra:
+            for row in range(self.bottom + 1, self.bottom + 1 + self.extra - n):
+                self._w(f"\033[{row};1H\033[2K")
+        else:
             return
-        # Mid-prompt: the saved cursor slot holds the transcript position, so don't touch it.
-        # Redraw the frame and put the prompt and what's been typed so far on the new prompt row.
-        try:
-            import readline
-            typed = readline.get_line_buffer()
-        except ImportError:
-            typed = ""
-        marker = self.marker.replace("\001", "").replace("\002", "")
+        self.extra = n
+        self._layout()
         self._w(f"\033[1;{self.bottom}r")
-        self.draw_frame(save=False)
-        self._w(f"\033[{self.bottom + 2};1H\033[2K" + marker + typed)
 
     def status_text(self):
         a = self.agent
@@ -1114,42 +1156,255 @@ class Screen:
             return "  " + yellow("⏵⏵ auto-approve on") + dim(" (/yolo to turn off)")
         return dim("  ? /help for commands · /model to switch models")
 
-    def draw_frame(self, save=True):
+    def draw_frame(self, save=True, below=None):
+        """Draw the rules and the rows under the prompt (status + hint, or the menu rows passed in)."""
         rule = dim("─" * self.w)
         row = self.bottom + 1
-        self._w(("\0337" if save else "")
-                + f"\033[{row};1H\033[2K" + rule
-                + f"\033[{row + 1};1H\033[2K"
-                + f"\033[{row + 2};1H\033[2K" + rule
-                + f"\033[{row + 3};1H\033[2K" + self.status_text()
-                + f"\033[{row + 4};1H\033[2K" + self.hint_text()
-                + ("\0338" if save else ""))
+        below = below if below is not None else [self.status_text(), self.hint_text()]
+        out = ("\0337" if save else "") + f"\033[{row};1H\033[2K" + rule + f"\033[{row + 2};1H\033[2K" + rule
+        for i in range(2 + self.extra):
+            out += f"\033[{row + 3 + i};1H\033[2K" + (below[i] if i < len(below) else "")
+        self._w(out + ("\0338" if save else ""))
 
-    def read_line(self, marker):
-        """Read one line in the pinned prompt row, then echo it into the transcript."""
-        self.draw_frame()
-        self._w("\0337" + f"\033[{self.bottom + 2};1H\033[2K")
-        self.marker, self.reading = marker, True
+    # ---- the line editor
+
+    def menu_items(self):
+        """Suggestions for what's typed so far: slash commands, or model names after '/model '."""
+        if self.menu_closed or "\n" in self.text():
+            return []
+        t = self.text()
+        if t.startswith("/model "):
+            if self.models is None:
+                try:
+                    self.models = list_models()
+                except (urllib.error.URLError, OSError):
+                    self.models = []
+            q = t[len("/model "):]
+            return [("/model " + m, m, "current" if m == self.agent.model else "")
+                    for m in self.models if m.startswith(q)][:self.MAX_MENU]
+        if t.startswith("/") and " " not in t:
+            return [(c, c, d) for c, d in COMMANDS.items() if c.startswith(t)][:self.MAX_MENU]
+        return []
+
+    def text(self):
+        return "".join(self.buf)
+
+    def render(self):
+        items = self.menu_items()
+        self.sel = min(self.sel, max(0, len(items) - 1))
+        self.grow(max(0, len(items) - 2))
+        if items:
+            width = max(len(label) for _, label, _ in items) + 3
+            below = [(cyan("  ❯ " + label.ljust(width)) if i == self.sel else "    " + label.ljust(width)) + dim(desc)
+                     for i, (_, label, desc) in enumerate(items)]
+        else:
+            below = None
+        self.draw_frame(save=False, below=below)
+        # The prompt row: scroll horizontally so the cursor stays visible; show newlines as ↵.
+        shown = self.text().replace("\n", "↵")
+        avail = max(10, self.w - 3)
+        start = max(0, self.pos - avail)
+        row = self.bottom + 2
+        if shown:
+            line = cyan("❯ ") + shown[start:start + avail]
+        else:
+            line = cyan("❯ ") + dim(PLACEHOLDER)
+        self._w(f"\033[{row};1H\033[2K" + line + f"\033[{row};{3 + self.pos - start}H")
+        return items
+
+    def read_line(self):
+        """Read one entry in the pinned prompt row, then echo it into the transcript."""
+        import codecs
+        import select
+        import termios
+
+        fd = sys.stdin.fileno()
+        saved_tty = termios.tcgetattr(fd)
+        raw = termios.tcgetattr(fd)
+        raw[3] &= ~(termios.ICANON | termios.ECHO | termios.ISIG | termios.IEXTEN)
+        raw[0] &= ~(termios.IXON | termios.ICRNL)
+        raw[6][termios.VMIN], raw[6][termios.VTIME] = 1, 0
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+
+        self.buf, self.pos, self.sel, self.menu_closed, self.in_paste = [], 0, 0, False, False
+        hist_i, draft = len(self.history), ""
+        self.shift = 0
+        self._w("\0337\033[?2004h")  # save the transcript cursor; turn on bracketed paste
+        self.reading = True
+        termios.tcsetattr(fd, termios.TCSADRAIN, raw)
+        result = None
+        pending = ""
         try:
-            line = input(marker)
+            items = self.render()
+            while result is None:
+                data = pending + decoder.decode(os.read(fd, 4096))
+                pending = ""
+                if data == "\x1b" and select.select([fd], [], [], 0.03)[0]:
+                    pending = data  # the rest of an escape sequence is on its way
+                    continue
+                i = 0
+                while i < len(data) and result is None:
+                    key, i = self._next_key(data, i)
+                    result = self._handle_key(key, items)
+                    if result is None:
+                        if key in ("up", "down") and not items:
+                            hist_i, draft = self._history_step(key, hist_i, draft)
+                        items = self.render()
         finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, saved_tty)
             self.reading = False
-            self._w(f"\033[{self.bottom + 2};1H\033[2K" + "\0338")
-        echo = line.rstrip("\\")
-        if echo:
+            self.grow(0)
+            self.draw_frame(save=False)
+            self._w(f"\033[{self.bottom + 2};1H\033[2K" + "\033[?2004l" + "\0338"
+                    + (f"\033[{self.shift}A" if self.shift else ""))
+        if isinstance(result, BaseException):
+            raise result
+        if result and (not self.history or self.history[-1] != result):
+            self.history.append(result)
+        if result.strip():
             if self.gap:
                 print()
-            print(cyan("❯ ") + bold(echo))
+            lines = result.strip().split("\n")
+            print(cyan("❯ ") + bold(lines[0]))
+            for extra in lines[1:]:
+                print("  " + bold(extra))
             self.gap = True
-        return line
+        return result
+
+    def _next_key(self, data, i):
+        """Split raw input into keys: printable text, control keys, escape sequences and pastes."""
+        if self.in_paste or data.startswith("\x1b[200~", i):
+            # Bracketed paste: everything up to the end marker is text, even if it spans several reads.
+            start = i if self.in_paste else i + 6
+            end = data.find("\x1b[201~", start)
+            self.in_paste = end == -1
+            if self.in_paste:
+                return ("paste", data[start:]), len(data)
+            return ("paste", data[start:end]), end + 6
+        ch = data[i]
+        if ch != "\x1b":
+            return ch, i + 1
+        if i + 1 >= len(data):
+            return "esc", i + 1
+        nxt = data[i + 1]
+        if nxt in "[O":
+            j = i + 2
+            while j < len(data) and not ("@" <= data[j] <= "~"):
+                j += 1
+            seq = data[i + 2:j + 1]
+            names = {"A": "up", "B": "down", "C": "right", "D": "left", "H": "home", "F": "end",
+                     "1~": "home", "7~": "home", "4~": "end", "8~": "end", "3~": "delete",
+                     "1;3D": "wordleft", "1;5D": "wordleft", "1;3C": "wordright", "1;5C": "wordright"}
+            return names.get(seq, "unknown"), j + 1
+        alt = {"b": "wordleft", "f": "wordright", "\x7f": "wordback"}
+        return alt.get(nxt, "unknown"), i + 2
+
+    def _handle_key(self, key, items):
+        """Apply one key to the buffer. Returns the finished text, an exception to raise, or None."""
+        buf, pos, before = self.buf, self.pos, self.text()
+        if isinstance(key, tuple):  # pasted text goes in as-is, newlines included
+            text = key[1].replace("\r\n", "\n").replace("\r", "\n")
+            buf[pos:pos] = list(text)
+            self.pos += len(text)
+        elif key in ("\r", "\n"):
+            if items:
+                return items[self.sel][0]
+            if pos and buf[pos - 1] == "\\":  # backslash + Enter: new line
+                buf[pos - 1] = "\n"
+                return None
+            return self.text()
+        elif key == "\t":
+            if items:
+                full = items[self.sel][0]
+                full += " " if full == "/model" else ""
+                self.buf, self.pos = list(full), len(full)
+        elif key in ("up", "down") and items:
+            self.sel = (self.sel + (1 if key == "down" else -1)) % len(items)
+            return None
+        elif key == "esc":
+            self.menu_closed = True
+            return None
+        elif key == "\x03":  # Ctrl-C: clear the line, or quit if it's already empty
+            if not buf:
+                return KeyboardInterrupt()
+            self.buf, self.pos = [], 0
+        elif key == "\x04":  # Ctrl-D: quit on an empty line, else delete forward
+            if not buf:
+                return EOFError()
+            if pos < len(buf):
+                del buf[pos]
+        elif key in ("\x7f", "\x08"):
+            if pos:
+                del buf[pos - 1]
+                self.pos -= 1
+        elif key == "delete":
+            if pos < len(buf):
+                del buf[pos]
+        elif key in ("left", "\x02"):
+            self.pos = max(0, pos - 1)
+        elif key in ("right", "\x06"):
+            self.pos = min(len(buf), pos + 1)
+        elif key in ("home", "\x01"):
+            self.pos = 0
+        elif key in ("end", "\x05"):
+            self.pos = len(buf)
+        elif key == "\x15":  # Ctrl-U
+            del buf[:pos]
+            self.pos = 0
+        elif key == "\x0b":  # Ctrl-K
+            del buf[pos:]
+        elif key in ("\x17", "wordback"):
+            j = pos
+            while j and buf[j - 1] == " ":
+                j -= 1
+            while j and buf[j - 1] != " ":
+                j -= 1
+            del buf[j:pos]
+            self.pos = j
+        elif key == "wordleft":
+            j = pos
+            while j and buf[j - 1] == " ":
+                j -= 1
+            while j and buf[j - 1] != " ":
+                j -= 1
+            self.pos = j
+        elif key == "wordright":
+            j = pos
+            while j < len(buf) and buf[j] == " ":
+                j += 1
+            while j < len(buf) and buf[j] != " ":
+                j += 1
+            self.pos = j
+        elif len(key) == 1 and key.isprintable():
+            buf.insert(pos, key)
+            self.pos += 1
+        else:
+            return None
+        if self.text() != before:
+            self.menu_closed = False  # typing again reopens a menu closed with Esc
+        return None
+
+    def _history_step(self, key, i, draft):
+        """Up/Down through past entries, keeping what was being typed as the newest one."""
+        if i == len(self.history):
+            draft = self.text()
+        i = max(0, i - 1) if key == "up" else min(len(self.history), i + 1)
+        text = self.history[i] if i < len(self.history) else draft
+        self.buf, self.pos = list(text), len(text)
+        self.menu_closed = True  # a recalled "/command" shouldn't pop the menu open and take over ↑/↓
+        return i, draft
 
     def stop(self):
         if not self.active:
             return
         self.active = False
-        # Release the scroll region (which homes the cursor), go back to the end of the conversation
-        # and clear the input box below it, so the shell prompt lands right under the transcript.
-        self._w("\0337" + "\033[r" + "\0338" + "\033[J")
+        try:
+            EDITOR_HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+            EDITOR_HISTORY_PATH.write_text("".join(json.dumps(h) + "\n" for h in self.history[-HISTORY_LENGTH:]))
+        except OSError:
+            pass
+        # Give the window back clean: release the scroll region and clear what localcode drew.
+        self._w("\033[?2004l\033[r\033[2J\033[H")
 
 
 def main():
@@ -1177,8 +1432,6 @@ def main():
             return
         save_state(model=model)
 
-    setup_readline()
-
     tools = Tools(args.cwd, auto_approve=args.yolo)
     agent = Agent(model, tools)
 
@@ -1190,6 +1443,7 @@ def main():
     screen.start()
     agent.show_stats = not screen.active  # the status line shows them instead
     if not screen.active:
+        setup_readline()  # plain-prompt fallback: readline's editing and history
         print(bold("localcode") + dim(f"  {agent.model}  ·  {tools.root}  ·  /help for commands"))
         print(instructions_status(agent.instructions))
     while True:
