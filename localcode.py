@@ -30,7 +30,9 @@ if not OLLAMA_HOST.startswith("http"):
 DEFAULT_MODEL = os.environ.get("LOCALCODE_MODEL", "qwen2.5-coder:14b")
 NUM_CTX = int(os.environ.get("LOCALCODE_NUM_CTX", "32768"))
 MAX_STEPS = 40
-MAX_TOOL_OUTPUT = 16000
+MAX_TOOL_OUTPUT = 24000
+READ_BUDGET = 12000  # chars per read_file call
+READ_FILES_BUDGET = 24000  # chars per read_files call
 IGNORED_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build", ".next", ".cache"}
 
 # ---------------------------------------------------------------- terminal UI
@@ -89,6 +91,62 @@ class Spinner:
             self.thread.join()
 
 
+class StreamPrinter:
+    """Prints streamed model text, but holds back anything that might be a text-format tool call.
+
+    Once a line starts like a tool call (``` fence, '{', <function=, <tool_call>), everything from
+    there on is held. finish() then prints it only if it turned out not to be a tool call.
+    """
+
+    MARKERS = ("```", "{", "<function=", "<tool_call>")
+
+    def __init__(self):
+        self.text = ""
+        self.printed = 0
+        self.holding = False
+        self.needs_newline = False
+
+    def _emit(self, s):
+        if s:
+            print(s, end="", flush=True)
+            self.needs_newline = not s.endswith("\n")
+
+    def _could_be_marker(self, line):
+        line = line.lstrip()
+        return not line or any(line.startswith(m) or m.startswith(line) for m in self.MARKERS)
+
+    def feed(self, s):
+        self.text += s
+        if self.holding:
+            return
+        # Look at each complete or partial line we haven't printed yet.
+        start = self.text.rfind("\n", 0, self.printed) + 1
+        while True:
+            nl = self.text.find("\n", start)
+            line = self.text[start:] if nl == -1 else self.text[start:nl]
+            stripped = line.lstrip()
+            if stripped and any(stripped.startswith(m) for m in self.MARKERS):
+                self._emit(self.text[self.printed:start])
+                self.printed = start
+                self.holding = True
+                return
+            if nl == -1:
+                # Partial line: print it unless it might still turn into a marker.
+                if not self._could_be_marker(line):
+                    self._emit(self.text[self.printed:])
+                    self.printed = len(self.text)
+                else:
+                    self._emit(self.text[self.printed:start])
+                    self.printed = max(self.printed, start)
+                return
+            start = nl + 1
+
+    def finish(self, show_held):
+        if show_held:
+            self._emit(self.text[self.printed:])
+        self.printed = len(self.text)
+
+
 def print_diff(old, new, path):
     lines = difflib.unified_diff(old.splitlines(), new.splitlines(), f"a/{path}", f"b/{path}", lineterm="", n=2)
     for line in lines:
@@ -108,7 +166,7 @@ class Tools:
         self.root = Path(root).resolve()
         self.auto_approve = auto_approve
         self.always = set()  # tool names approved for the rest of the session
-        self.read_files = set()
+        self.seen = {}  # (path, offset) -> (mtime, last line) for the repeat-read guard
 
     def resolve(self, path):
         p = Path(os.path.expanduser(path or "."))
@@ -135,19 +193,57 @@ class Tools:
 
     # each tool returns a string that is fed back to the model
 
-    def read_file(self, path, offset=1, limit=400):
+    def forget(self):
+        """Drop the record of what's been read (the model no longer has it after /clear)."""
+        self.seen.clear()
+
+    def read_file(self, path, offset=1, limit=None, budget=READ_BUDGET):
         p = self.resolve(path)
         if not p.is_file():
             return f"Error: {path} is not a file"
-        lines = p.read_text(errors="replace").splitlines()
         offset = max(1, int(offset or 1))
-        limit = int(limit or 400)
-        chunk = lines[offset - 1: offset - 1 + limit]
-        self.read_files.add(p)
-        out = "\n".join(f"{i:5}| {l}" for i, l in enumerate(chunk, offset))
-        if offset - 1 + limit < len(lines):
-            out += f"\n... ({len(lines)} lines total; use offset to read more)"
-        return out or "(empty file)"
+        mtime = p.stat().st_mtime
+        if self.seen.get((p, offset), (None,))[0] == mtime:
+            end = self.seen[(p, offset)][1]
+            return (f"You already read lines {offset}-{end} of {self.rel(p)} earlier in this conversation "
+                    "and the file hasn't changed since. Use that output instead of reading it again.")
+        lines = p.read_text(errors="replace").splitlines()
+        if not lines:
+            return "(empty file)"
+        if offset > len(lines):
+            return f"Error: offset {offset} is past the end ({len(lines)} lines)"
+        # Fill up to the character budget on whole lines, so results are never cut mid-line.
+        out, used, end = [], 0, offset - 1
+        stop = len(lines) if not limit else min(len(lines), offset - 1 + int(limit))
+        for i in range(offset - 1, stop):
+            row = f"{i + 1:5}| {lines[i]}"
+            if out and used + len(row) + 1 > budget:
+                break
+            out.append(row)
+            used += len(row) + 1
+            end = i + 1
+        self.seen[(p, offset)] = (mtime, end)
+        text = "\n".join(out)
+        if end < len(lines):
+            text += (f"\n... showing lines {offset}-{end} of {len(lines)}. "
+                     f"Call read_file with offset={end + 1} to continue.")
+        return text
+
+    def read_files(self, paths):
+        if isinstance(paths, str):
+            paths = [paths]
+        parts, used, skipped = [], 0, []
+        for path in paths:
+            remaining = READ_FILES_BUDGET - used
+            if remaining < 2000:
+                skipped.append(path)
+                continue
+            body = self.read_file(path, budget=min(READ_BUDGET, remaining))
+            parts.append(f"==> {path} <==\n{body}")
+            used += len(parts[-1]) + 1
+        if skipped:
+            parts.append(f"Not read (output limit reached): {', '.join(skipped)}. Read them in another call.")
+        return "\n\n".join(parts)
 
     def write_file(self, path, content):
         p = self.resolve(path)
@@ -252,9 +348,13 @@ def schema(name, desc, props, required):
 
 S = {"type": "string"}
 TOOL_SCHEMAS = [
-    schema("read_file", "Read a text file. Returns lines prefixed with line numbers.",
+    schema("read_file", "Read one text file. Returns lines prefixed with line numbers. Long files come back "
+           "in pages; the result says which offset to pass to continue.",
            {"path": S, "offset": {"type": "integer", "description": "1-based start line"},
-            "limit": {"type": "integer", "description": "max lines (default 400)"}}, ["path"]),
+            "limit": {"type": "integer", "description": "max lines (optional)"}}, ["path"]),
+    schema("read_files", "Read several text files in one call. Prefer this over repeated read_file calls "
+           "when you need more than one file, e.g. to get familiar with a project.",
+           {"paths": {"type": "array", "items": S}}, ["paths"]),
     schema("write_file", "Create or overwrite a file with the full content.",
            {"path": S, "content": S}, ["path", "content"]),
     schema("edit_file", "Replace an exact string in a file. old_string must match exactly once "
@@ -296,6 +396,7 @@ Top-level files:
 {"Git status:" + chr(10) + git if git else ""}
 Rules:
 - Use tools to look at the code before changing it. Never guess file contents.
+- When you need several files (for example to get familiar with a project), read them together with one read_files call.
 - To change an existing file, read it first, then use edit_file with an exact old_string copied from the file (without the line-number prefix).
 - Make one tool call at a time when later steps depend on earlier results.
 - After making changes, verify them (run tests, the build, or the script) when that is possible.
@@ -393,32 +494,40 @@ class Agent:
     def reset(self):
         prompt, self.instructions = system_prompt(self.tools.root)
         self.messages = [{"role": "system", "content": prompt}]
+        self.tools.forget()
 
     def chat_once(self):
-        """Stream one assistant turn. Returns (content, tool_calls)."""
+        """Stream one assistant turn. Returns (content, tool_calls, native)."""
         payload = {"model": self.model, "messages": self.messages, "tools": TOOL_SCHEMAS,
                    "stream": True, "options": {"num_ctx": NUM_CTX}}
-        content, tool_calls, thinking_shown = "", [], False
+        tool_calls, thinking_shown = [], False
+        printer = StreamPrinter()
         stats = {}
         spinner = Spinner()
         try:
             for chunk in ollama("/api/chat", payload, stream=True):
                 spinner.stop()
-                content, thinking_shown, done = self._handle_chunk(chunk, content, tool_calls, thinking_shown)
+                thinking_shown, done = self._handle_chunk(chunk, printer, tool_calls, thinking_shown)
                 if done:
                     stats = chunk
         finally:
             spinner.stop()
-        if content or thinking_shown:
+        content = printer.text
+        native = bool(tool_calls)
+        if not native:
+            tool_calls = parse_text_tool_calls(content)
+        # Text that turned out to be a tool call stays hidden; the ● line below shows it instead.
+        printer.finish(show_held=native or not tool_calls)
+        if printer.needs_newline or thinking_shown:
             print()
         if stats.get("eval_count"):
             secs = stats.get("eval_duration", 1) / 1e9
             ctx = stats.get("prompt_eval_count", 0) + stats["eval_count"]
             print(dim(f"  [{stats['eval_count']} tok, {stats['eval_count'] / secs:.1f} tok/s, ctx ~{ctx}/{NUM_CTX}]"))
-        return content, tool_calls
+        return content, tool_calls, native
 
-    def _handle_chunk(self, chunk, content, tool_calls, thinking_shown):
-        """Print one streamed chunk. Returns (content, thinking_shown, done)."""
+    def _handle_chunk(self, chunk, printer, tool_calls, thinking_shown):
+        """Print one streamed chunk. Returns (thinking_shown, done)."""
         if "error" in chunk:
             raise RuntimeError(chunk["error"])
         msg = chunk.get("message", {})
@@ -431,18 +540,14 @@ class Agent:
             if thinking_shown:
                 print()
                 thinking_shown = False
-            content += msg["content"]
-            print(msg["content"], end="", flush=True)
+            printer.feed(msg["content"])
         tool_calls.extend(msg.get("tool_calls") or [])
-        return content, thinking_shown, bool(chunk.get("done"))
+        return thinking_shown, bool(chunk.get("done"))
 
     def run(self, user_input):
         self.messages.append({"role": "user", "content": user_input})
         for _ in range(MAX_STEPS):
-            content, tool_calls = self.chat_once()
-            native = bool(tool_calls)
-            if not native:
-                tool_calls = parse_text_tool_calls(content)
+            content, tool_calls, native = self.chat_once()
             self.messages.append({"role": "assistant", "content": content,
                                   **({"tool_calls": tool_calls} if native else {})})
             if not tool_calls:
@@ -460,7 +565,9 @@ class Agent:
                 print(cyan(f"● {name}") + dim(f"({preview})"))
                 result = str(self.tools.call(name, args))
                 if len(result) > MAX_TOOL_OUTPUT:
-                    result = result[:MAX_TOOL_OUTPUT] + f"\n... (truncated {len(result) - MAX_TOOL_OUTPUT} chars)"
+                    cut = result.rfind("\n", 0, MAX_TOOL_OUTPUT)
+                    cut = cut if cut > 0 else MAX_TOOL_OUTPUT
+                    result = result[:cut] + f"\n... (output cut off here; {len(result) - cut} more chars not shown)"
                 first = result.splitlines()[0] if result else ""
                 print(dim(f"  └ {first[:120]}" + (f"  (+{result.count(chr(10))} lines)" if "\n" in result else "")))
                 if native:

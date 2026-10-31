@@ -14,7 +14,9 @@ python3 localcode.py -m qwen3-coder:30b        # pick a model
 
 ## Tools the model gets
 
-`read_file`, `write_file`, `edit_file`, `list_dir`, `glob`, `grep`, `bash`.
+`read_file`, `read_files` (several files in one call), `write_file`, `edit_file`, `list_dir`, `glob`, `grep`, `bash`.
+
+Long files are returned in pages with the exact `offset` to read next. Re-reading an unchanged file gets a short "you already have this" reply instead of the full text again.
 
 Writes, edits and shell commands show a diff or the command and ask before running: `[y]es / [n]o / [a]lways`. `--yolo` skips the prompts.
 
