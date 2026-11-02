@@ -2,6 +2,10 @@
 
 A terminal coding agent built around local [Ollama](https://ollama.com) models. One Python file, standard library only.
 
+![An illustrative localcode session rendered from the terminal interface, showing the multiline composer and session status](docs/terminal-preview.svg)
+
+*Sample conversation rendered from the interface. Colors and fonts follow your terminal's settings.*
+
 ## Install
 
 Needs Python 3.9+ and [Ollama](https://ollama.com).
@@ -24,6 +28,8 @@ localcode                        # interactive, works in the current directory
 localcode -C ~/code/myproject
 localcode "fix the failing tests"   # one-shot
 localcode -m qwen3-coder:30b        # pick a model
+localcode --plain                 # inline prompts and native terminal scrollback
+localcode --version
 ```
 
 ## Tools the model gets
@@ -32,21 +38,53 @@ localcode -m qwen3-coder:30b        # pick a model
 
 Long files are returned in pages with the exact `offset` to read next. Re-reading an unchanged file gets a short "you already have this" reply instead of the full text again.
 
-Writes, edits and shell commands show a diff or the command and ask before running: `[y]es / [n]o / [a]lways`. `--yolo` skips the prompts.
+Writes, edits and shell commands show a diff or the command and ask before running: `[Y]es / [n]o / [a]lways for this tool`. Enter accepts; `a` remembers that tool for the current session. `--yolo` skips the prompts. The status line shows whether writes and commands need approval; `/status` also lists tools you've allowed for the session.
 
 ## Output
 
-localcode runs full-window on the terminal's alternate screen, like `vim` or `htop`: your earlier terminal output is out of view while it runs and comes back unchanged when you quit. The LOCALCODE banner stays pinned at the top, the conversation scrolls in the middle, and the input box stays pinned to the bottom with a status line under it showing the model, the folder, how much of the context window is used, and the last reply's speed. Scroll back through the conversation with the mouse wheel, PgUp/PgDn or Shift+↑/↓. Because the mouse wheel is handled by localcode, selecting text with the mouse needs your terminal's override key held while dragging (Fn in Terminal.app, Option in iTerm2). Reasoning models' thinking is collapsed to a single "✻ Thought for Ns" line (set `LOCALCODE_SHOW_THINKING=1` to see it).
+localcode runs full-window on the terminal's alternate screen, like `vim` or `htop`: your earlier terminal output is out of view while it runs and comes back unchanged when you quit. A compact header shows the workspace, leaving room for the conversation. The input stays pinned at the bottom, above the model, approval mode, context usage, and last reply's speed. A context meter appears in wider windows; narrow windows use a percentage.
+
+The welcome screen offers starter tasks and tells you whether project instructions were loaded. Try `/status` for the full session details, including your Ollama address. It doesn't call the model or consume context.
+
+Scroll back through the conversation with the mouse wheel, PgUp/PgDn or Shift+↑/↓. Because the mouse wheel is handled by localcode, selecting text with the mouse needs your terminal's override key held while dragging (Fn in Terminal.app, Option in iTerm2). Use `--plain` if you prefer native terminal scrolling, selection, or a simpler display. `NO_COLOR=1` also uses inline prompts without color. Piped output stays plain Markdown.
+
+Reasoning models' thinking is collapsed to a single "✻ Thought for Ns" line (set `LOCALCODE_SHOW_THINKING=1` to see it).
+
+An example of the layout (colors omitted):
+
+```text
+  ◆ localcode  /  Ollama
+  ~/code/myproject
+
+Your project. Your models.
+Start with a task, or explore before making changes.
+
+  ❯ Explain how this project works
+  ❯ Find the cause of a bug and propose a fix
+
+/model choose a model   /help keys and commands
+────────────────────────────────────────────────────────────────────────────────
+❯ Ask about this project…  / commands
+────────────────────────────────────────────────────────────────────────────────
+  gpt-oss:20b · ask to edit · ▱▱▱▱▱▱▱▱ 0% context
+  / commands · ↑↓ history · PgUp scroll · Ctrl-C clear / quit
+```
 
 Replies are rendered as Markdown while they stream: headings and **bold** in bold, `code` in color, bullets as •, code blocks with a side bar, and tables drawn as aligned boxes that fit the terminal width. When output is piped instead of shown in a terminal, the raw Markdown is passed through.
 
 ## Commands and keys
 
-Type `/` and a menu of commands appears under the input: ↑/↓ to choose, Tab to complete, Enter to run, Esc to close. After `/model ` it suggests your installed models.
+Type `/` and a menu of commands appears under the input: ↑/↓ to choose, Tab to complete, Enter to run, Esc to close. Search by name or description: `/clipboard` finds `/copy`. The menu scrolls as you move through its results. After `/model ` it searches your installed models.
+
+The model picker is searchable too: type part of a name, parameter size, or `native tools` / `text fallback`. ↑/↓ moves through results, PgUp/PgDn moves a page, Enter chooses, and Esc cancels. It keeps the current model selected when first opened and adapts to your window size.
 
 | Command | |
 | --- | --- |
 | `/model` | Open the model picker, or `/model <name>` to switch straight to one |
+| `/status` | Show the model, Ollama address, workspace, instructions, context, and approvals |
+| `/history` | Search saved prompts; in full-screen mode, the selected prompt returns to editing without being sent |
+| `/copy` | Copy the last assistant reply to the clipboard (`pbcopy` on macOS) |
+| `/export [path]` | Save a Markdown conversation; defaults to a timestamped file in the workspace and refuses to overwrite files |
 | `/clear` | Start a fresh conversation (re-reads `AGENTS.md`) |
 | `/yolo` | Toggle auto-approve for writes and commands |
 | `/help` | Show commands and keys |
@@ -56,11 +94,23 @@ Type `/` and a menu of commands appears under the input: ↑/↓ to choose, Tab 
 | --- | --- |
 | Mouse wheel, PgUp/PgDn, Shift+↑/↓ | Scroll back through the conversation |
 | ↑/↓ | Step through past entries (saved across sessions in `~/.config/localcode/history.jsonl`) |
+| Ctrl-R | Search prompt history and return a selection to the editor without sending it |
+| Ctrl-O | Insert a newline; the composer grows to five lines and scrolls for longer prompts |
+| ↑/↓ in a multiline draft | Move between lines; Ctrl-A / Ctrl-E moves to the start/end of the current line |
 | `\` then Enter | Start a new line; pasting multi-line text also works |
 | Ctrl-C | Clear the line; on an empty line, quit |
+| Ctrl-D | Quit on an empty line; otherwise delete the next character |
 | Ctrl-A / Ctrl-E, Ctrl-U / Ctrl-K, Ctrl-W | Start/end of line, delete to start/end, delete word |
 
 The model you pick is remembered for next time (in `~/.config/localcode/state.json`); switching keeps the conversation.
+
+## Keep useful work
+
+Use Ctrl-R to find a previous prompt by a few words. Select it, revise it in the composer, then press Enter when ready. Cancelling keeps your current draft. In `--plain` mode, `/history` offers numbered selection and prints the chosen prompt for copying; readline also provides your shell's usual history search.
+
+After a useful reply, `/copy` puts its original Markdown on the Mac clipboard, including code fences. On Linux it tries `wl-copy`, `xclip`, or `xsel` if installed. If the terminal has no clipboard access, it points you to `/export`.
+
+Use `/export notes.md` to keep the conversation in your project, or `/export` for a timestamped filename. Export includes user messages and assistant replies without internal instructions, tool-call payloads, or file contents returned by tools. It creates a new file and never overwrites one. These commands do not make model requests or change the current context.
 
 ## Settings
 
@@ -78,3 +128,13 @@ On startup, localcode looks for `AGENTS.md` (any capitalization) in the project 
 Some models print tool calls as text instead of returning them as structured calls (qwen2.5-coder writes bare JSON; qwen3-coder writes `<function=...>` XML). localcode parses both formats.
 
 The default is `gpt-oss:20b` (`ollama pull gpt-oss:20b`). It's a mixture-of-experts model that uses about 3.6B parameters per token, so on a 24 GB M-series MacBook Air it runs fully on the GPU at a 32k context (12 GB) and generates at about 18 tok/s, roughly twice as fast as the dense `qwen2.5-coder:14b`. `qwen3-coder:30b` doesn't fully fit on the GPU on that machine and runs slowly.
+
+## Development
+
+No runtime dependencies are needed. Run the regression suite with:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+The suite uses simulated Ollama responses and a real POSIX pseudo-terminal to check commands, pasted multi-line Unicode text, scrollback, resizing, and terminal restoration. It runs without Ollama or downloaded models. Live model performance and macOS terminal appearance should still be checked on your Mac.

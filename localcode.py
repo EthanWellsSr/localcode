@@ -24,12 +24,14 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import unicodedata
 from pathlib import Path
 
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
 if not OLLAMA_HOST.startswith("http"):
     OLLAMA_HOST = "http://" + OLLAMA_HOST
 DEFAULT_MODEL = "gpt-oss:20b"
+VERSION = "0.1.0"
 NUM_CTX = int(os.environ.get("LOCALCODE_NUM_CTX", "32768"))
 MAX_STEPS = 40
 SHOW_THINKING = os.environ.get("LOCALCODE_SHOW_THINKING") == "1"  # else collapsed to "Thought for Ns"
@@ -109,7 +111,30 @@ BOLD, NOT_BOLD, CODE, NOT_CODE = "\033[1m", "\033[22m", "\033[36m", "\033[39m"
 
 
 def visible_len(s):
-    return len(ANSI_RE.sub("", s))
+    return sum(char_width(ch) for ch in ANSI_RE.sub("", s))
+
+
+def char_width(ch):
+    """Terminal cells for ordinary text, including CJK and combining accents."""
+    if unicodedata.category(ch) in ("Mn", "Me", "Cf", "Cc"):
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+
+def clip_ansi(text, width):
+    """Clip without wrapping, preserving complete color escapes."""
+    out, used = [], 0
+    for tok in re.findall(r"\x1b\[[0-9;]*m|.", text):
+        cells = 0 if tok.startswith("\x1b") else char_width(tok)
+        if used + cells > max(0, width):
+            break
+        out.append(tok)
+        used += cells
+    return "".join(out)
+
+
+def abbreviate(text, width):
+    return text if visible_len(text) <= width else clip_ansi(text, max(0, width - 1)) + ("…" if width else "")
 
 
 def render_inline(s):
@@ -124,7 +149,7 @@ def wrap_ansi(s, width):
     for tok in re.findall(r"\x1b\[[0-9;]*m|.", s) + [" "]:
         if tok != " ":
             word += tok
-            wvis += 0 if tok.startswith("\x1b") else 1
+            wvis += 0 if tok.startswith("\x1b") else char_width(tok)
             continue
         if not word:
             continue
@@ -411,7 +436,7 @@ class Tools:
             return True
         print(yellow(f"  allow {tool}? ") + summary)
         try:
-            question = yellow("  [y]es / [n]o / [a]lways: ")
+            question = yellow("  [Y]es / [n]o / [a]lways for this tool: ")
             ask = getattr(sys.stdout, "ask", None)  # full-window mode records the prompt and answer
             ans = ask(question) if ask else input(prompt(question))
         except EOFError:
@@ -656,7 +681,7 @@ def find_instructions(root):
 def instructions_status(path):
     if path:
         return green(f"✓ {path.name} found and ingested")
-    return dim("✗ no AGENTS.md found")
+    return dim("No project instructions · add AGENTS.md to guide your agent")
 
 
 # ---------------------------------------------------------------- model client
@@ -820,6 +845,10 @@ class Agent:
 
 COMMANDS = {
     "/model": "pick a model, or /model <name> to switch straight to one",
+    "/status": "show model, workspace, context, and approvals",
+    "/history": "search past prompts and put one back in the editor",
+    "/copy": "copy the last reply to the clipboard",
+    "/export": "save this conversation as Markdown: /export [path]",
     "/clear": "start a fresh conversation",
     "/yolo": "toggle auto-approve for writes and commands",
     "/help": "show commands and keys",
@@ -830,6 +859,10 @@ HELP = "Commands:\n" + "\n".join(f"  {c:<8} {d}" for c, d in COMMANDS.items()) +
 Keys:
   /          suggest commands (↑/↓ to choose, Tab to complete, Enter to run, Esc to close)
   ↑/↓        step through past entries
+  PgUp/PgDn  scroll the conversation (mouse wheel also works)
+  Ctrl-R     search prompt history without sending it
+  Ctrl-O     insert a new line (Enter sends)
+  Ctrl-D     quit on an empty line
   \\ + Enter  start a new line
   Ctrl-C     clear the line; on an empty line, quit"""
 STATE_PATH = Path(os.environ.get("XDG_CONFIG_HOME") or "~/.config").expanduser() / "localcode" / "state.json"
@@ -867,81 +900,122 @@ def model_details():
     return details
 
 
+def picker_matches(rows, query):
+    words = query.casefold().split()
+    return [i for i, row in enumerate(rows)
+            if all(word in ANSI_RE.sub("", row).casefold() for word in words)]
+
+
 def pick(rows, start=0, title=""):
-    """Arrow-key list picker. Returns the chosen index, or None if cancelled."""
+    """Searchable, scrollable chooser. Returns the original row index, never a filtered index."""
     if not rows:
         return None
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
-        for i, r in enumerate(rows, 1):
-            print(f"  {i}. {r}")
+        for i, row in enumerate(rows, 1):
+            print(f"  {i}. {row}")
         try:
-            n = input("Number (blank to cancel): ").strip()
+            answer = input("Number (blank to cancel): ").strip()
         except EOFError:
             return None
-        return int(n) - 1 if n.isdigit() and 1 <= int(n) <= len(rows) else None
+        return int(answer) - 1 if answer.isdigit() and 1 <= int(answer) <= len(rows) else None
 
+    import codecs
     import select
     import termios
     import tty
 
     fd = sys.stdin.fileno()
     saved = termios.tcgetattr(fd)
-    sel = start if 0 <= start < len(rows) else 0
     out = term_out()
+    nested = isinstance(sys.stdout, Transcript)
+    query, selected, matches, pending = "", start if 0 <= start < len(rows) else 0, list(range(len(rows))), ""
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
 
-    def draw(first=False):
-        if not first:
-            out.write(f"\033[{len(rows)}A")
-        for i, r in enumerate(rows):
-            out.write("\r\033[K" + (cyan(f"❯ {r}") if i == sel else f"  {r}") + "\n")
+    def draw():
+        width, height = shutil.get_terminal_size()
+        capacity = max(1, height - 6)
+        first = max(0, min(selected - capacity // 2, len(matches) - capacity))
+        lines = [bold(title), cyan("Search ❯ ") + query, dim("─" * width)]
+        for position in range(first, min(len(matches), first + capacity)):
+            text = rows[matches[position]].replace("\n", " ↵ ")
+            lines.append((cyan("❯ ") + bold(text)) if position == selected else "  " + text)
+        if not matches:
+            lines.append(dim("No matches. Backspace to broaden your search."))
+        footer = f"{selected + 1 if matches else 0}/{len(matches)} · ↑↓ choose · Enter select · Esc cancel"
+        out.write("\033[H\033[2J" + "\r\n".join(clip_ansi(line, max(1, width - 1)) + "\033[0m"
+                                                     for line in lines[:max(1, height - 1)]))
+        out.write(f"\033[{max(1, height)};1H" + clip_ansi(dim(footer), max(1, width - 1)))
         out.flush()
 
-    out.write(dim(title) + "\n")
-    out.write("\033[?25l")
-    result = None
     try:
-        tty.setcbreak(fd)
-        draw(first=True)
+        if not nested:
+            out.write("\033[?1049h")
+        out.write("\033[r\033[?25l\033[?1000l")
+        tty.setraw(fd)
+        draw()
         while True:
-            ch = os.read(fd, 1)
-            if ch == b"\x1b":
-                if not select.select([fd], [], [], 0.05)[0]:
-                    break  # bare Esc
-                seq = os.read(fd, 2)
-                if seq == b"[A":
-                    sel = (sel - 1) % len(rows)
-                elif seq == b"[B":
-                    sel = (sel + 1) % len(rows)
-            elif ch in (b"\r", b"\n"):
-                result = sel
-                break
-            elif ch == b"k":
-                sel = (sel - 1) % len(rows)
-            elif ch == b"j":
-                sel = (sel + 1) % len(rows)
-            elif ch.isdigit() and 1 <= int(ch) <= len(rows):
-                sel = int(ch) - 1
-            elif ch in (b"q", b"\x03"):
-                break
+            if not select.select([fd], [], [], 0.2)[0]:
+                draw()  # also adapt if the window changed size
+                continue
+            chunk = os.read(fd, 4096)
+            if not chunk:
+                return None
+            data = pending + decoder.decode(chunk)
+            pending = ""
+            if data == "\x1b" and select.select([fd], [], [], 0.05)[0]:
+                pending = data
+                continue
+            index = 0
+            while index < len(data):
+                ch = data[index]
+                if ch == "\x1b" and index + 1 < len(data) and data[index + 1] == "[":
+                    end = index + 2
+                    while end < len(data) and not ("@" <= data[end] <= "~"):
+                        end += 1
+                    if end == len(data):
+                        pending = data[index:]
+                        break
+                    key = data[index + 2:end + 1]
+                    selected += {"A": -1, "B": 1, "5~": -max(1, shutil.get_terminal_size().lines - 6),
+                                 "6~": max(1, shutil.get_terminal_size().lines - 6)}.get(key, 0)
+                    index = end + 1
+                else:
+                    index += 1
+                    if ch in ("\x1b", "\x03", "\x04"):
+                        return None
+                    if ch in ("\r", "\n"):
+                        return matches[selected] if matches else None
+                    if ch in ("\x7f", "\x08"):
+                        query = query[:-1]
+                    elif ch == "\x15":
+                        query = ""
+                    elif ch.isprintable():
+                        query += ch
+                    else:
+                        continue
+                    matches, selected = picker_matches(rows, query), 0
+                selected = max(0, min(selected, len(matches) - 1))
             draw()
-    except KeyboardInterrupt:
-        pass
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, saved)
-        out.write(f"\033[{len(rows) + 1}A\r\033[J\033[?25h")  # erase the picker
+        out.write("\033[0m\033[?25h")
+        if nested:
+            out.write("\033[?1000h")
+        else:
+            out.write("\033[?1049l")
         out.flush()
-    return result
 
 
-def pick_model(current):
+
+def pick_model(current, chooser=pick):
     models = model_details()
-    width = max(len(m["name"]) for m in models) if models else 0
-    rows = [f"{m['name']:<{width}}  {m['params']:>6}  {m['size'] / 1e9:5.1f} GB"
+    width = min(35, max(visible_len(m["name"]) for m in models)) if models else 0
+    rows = [f"{abbreviate(m['name'], width):<{width}}  {m['params']:>6}  {m['size'] / 1e9:5.1f} GB"
             + ("  (current)" if m["name"] == current else "")
-            + ("" if m["tools"] else "  · no tool support") for m in models]
+            + ("  · native tools" if m["tools"] else "  · text fallback") for m in models]
     names = [m["name"] for m in models]
-    i = pick(rows, names.index(current) if current in names else 0,
-             "Select a model  (↑/↓ to move, Enter to choose, Esc to cancel)")
+    i = chooser(rows, names.index(current) if current in names else 0,
+             "Choose your Ollama model · type a name, size, or capability to filter")
     return names[i] if i is not None else None
 
 
@@ -1031,36 +1105,106 @@ def short_path(p):
     return "~" + p[len(home):] if p == home or p.startswith(home + os.sep) else p
 
 
-BIG = {  # 3-row block letters for the banner
-    "L": ["█   ", "█   ", "▀▀▀▀"], "O": ["█▀▀█", "█  █", "▀▀▀▀"], "C": ["█▀▀▀", "█   ", "▀▀▀▀"],
-    "A": ["█▀▀█", "█▀▀█", "▀  ▀"], "D": ["█▀▀▄", "█  █", "▀▀▀ "], "E": ["█▀▀▀", "█▀▀ ", "▀▀▀▀"],
-}
-PLACEHOLDER = "Ask anything, or type / for commands"
+PLACEHOLDER = "Ask about this project…  / commands"
 EDITOR_HISTORY_PATH = STATE_PATH.parent / "history.jsonl"
 
 
 def header_lines(agent, width, height):
-    """The pinned banner: big LOCALCODE lettering when there's room, else a single line."""
-    info = dim(f"{agent.model} · Ollama · {short_path(agent.tools.root)}")
-    if width >= 50 and height >= 24:
-        big = [cyan(" ".join(BIG[ch][r] for ch in "LOCALCODE")) for r in range(3)]
-        return ["", *big, "", info, instructions_status(agent.instructions), ""]
-    return [bold("localcode") + "  " + info, ""]
+    """Keep the identity visible without spending the conversation's screen space."""
+    title = "  " + cyan("◆") + " " + bold("localcode") + dim("  /  Ollama")
+    if height < 16:
+        return [title]
+    project = abbreviate(short_path(agent.tools.root), max(1, width - 4))
+    return [title, "  " + dim(project), ""]
+
+
+def welcome_lines(agent):
+    return [bold("Your project. Your models."),
+            dim("Start with a task, or explore before making changes."), "",
+            cyan("  ❯ ") + "Explain how this project works",
+            cyan("  ❯ ") + "Find the cause of a bug and propose a fix", "",
+            dim("/model") + " choose a model   " + dim("/help") + " keys and commands",
+            instructions_status(agent.instructions)]
+
+
+def show_status(agent):
+    """Local session details; never sends a request to the model."""
+    pct = round(100 * agent.ctx_used / NUM_CTX) if NUM_CTX else 0
+    print(bold("Session"))
+    for label, value in [
+        ("Model", agent.model), ("Ollama", OLLAMA_HOST),
+        ("Workspace", str(agent.tools.root)),
+        ("Instructions", str(agent.instructions) if agent.instructions else "No project instructions"),
+        ("Context", f"{fmt_tokens(agent.ctx_used)} / {fmt_tokens(NUM_CTX)} ({pct}%)"),
+        ("Approvals", "Auto-approve" if agent.tools.auto_approve else "Ask before writes and commands"),
+        ("Allowed this session", ", ".join(sorted(agent.tools.always)) or "None"),
+    ]:
+        print("  " + dim(f"{label:<21}") + value)
+    if agent.last_speed:
+        print("  " + dim(f"{'Last reply':<21}") + f"{agent.last_speed:.1f} tok/s")
+
+
+def conversation_markdown(agent):
+    """Export visible conversation only, excluding system prompts and tool output."""
+    parts = ["# localcode conversation", f"Model: {agent.model}\nWorkspace: {agent.tools.root}"]
+    for message in agent.messages:
+        role, content = message.get("role"), message.get("content", "")
+        if role not in ("user", "assistant") or not content:
+            continue
+        if role == "user" and content.startswith("Tool result for "):
+            continue
+        if role == "assistant" and (message.get("tool_calls") or parse_text_tool_calls(content)):
+            continue
+        parts.extend(["## You" if role == "user" else "## Assistant", content])
+    return "\n\n".join(parts) + "\n"
+
+
+def export_conversation(agent, filename=""):
+    name = filename.strip() or time.strftime("localcode-%Y%m%d-%H%M%S.md")
+    path = Path(name).expanduser()
+    if not path.is_absolute():
+        path = agent.tools.root / path
+    # A typo or repeated command must never silently replace an existing file.
+    with path.open("x", encoding="utf-8") as stream:
+        stream.write(conversation_markdown(agent))
+    return path
+
+
+def copy_reply(agent):
+    reply = next((m["content"] for m in reversed(agent.messages)
+                  if m.get("role") == "assistant" and m.get("content")
+                  and not m.get("tool_calls") and not parse_text_tool_calls(m["content"])), None)
+    if reply is None:
+        raise ValueError("No reply to copy yet. Ask the model a question first.")
+    candidates = [["pbcopy"]] if sys.platform == "darwin" else [
+        ["wl-copy"], ["xclip", "-selection", "clipboard"], ["xsel", "--clipboard", "--input"]]
+    command = next((c for c in candidates if shutil.which(c[0])), None)
+    if command is None:
+        raise ValueError("No clipboard utility found. Use /export to save the conversation instead.")
+    try:
+        result = subprocess.run(command, input=reply, text=True, capture_output=True, timeout=5)
+    except subprocess.TimeoutExpired:
+        raise ValueError("Clipboard did not respond. Use /export instead.") from None
+    if result.returncode:
+        raise ValueError("Clipboard is unavailable in this terminal. Use /export instead.")
 
 
 def hard_wrap(line, width):
     """Split a line (with color codes) into terminal rows exactly as the terminal would wrap it."""
+    width = max(1, width)
     rows, row, vis, active = [], "", 0, ""
     for tok in re.findall(r"\x1b\[[0-9;]*m|.", line):
         if tok.startswith("\x1b"):
             row += tok
             active = "" if tok in ("\x1b[0m", "\x1b[m") else active + tok
             continue
-        if vis == width:
+        cells = char_width(tok)
+        if vis and vis + cells > width:
             rows.append(row + "\x1b[0m")
             row, vis = active, 0
-        row += tok
-        vis += 1
+        if cells <= width:
+            row += tok
+            vis += cells
     rows.append(row)
     return rows
 
@@ -1129,8 +1273,16 @@ class Transcript:
 def load_editor_history():
     """One JSON string per line. On first run, import the old readline history file."""
     try:
-        return [json.loads(l) for l in EDITOR_HISTORY_PATH.read_text().splitlines() if l.strip()][-HISTORY_LENGTH:]
-    except (OSError, ValueError):
+        entries = []
+        for line in EDITOR_HISTORY_PATH.read_text().splitlines():
+            try:
+                value = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(value, str):
+                entries.append(value)
+        return entries[-HISTORY_LENGTH:]
+    except OSError:
         pass
     try:
         lines = HISTORY_PATH.read_text().splitlines()
@@ -1157,8 +1309,9 @@ class Screen:
     MIN_ROWS = 12
     MAX_MENU = 8
 
-    def __init__(self, agent):
+    def __init__(self, agent, plain=False):
         self.agent = agent
+        self.plain = plain
         self.active = False
         self.reading = False  # True while read_line() owns the prompt row
         self.extra = 0        # rows the box has grown upward for the menu
@@ -1166,11 +1319,15 @@ class Screen:
         self.gap = False      # print a blank line before the next echoed message
         self.history = []
         self.models = None    # installed model names, fetched when the /model menu first needs them
+        self.resize_handler = None
+        self.prefill = ""
+        self.choosing = False
+        self.input_rows = 1
 
     # ---- layout
 
     def start(self):
-        if not (USE_COLOR and sys.stdin.isatty()) or shutil.get_terminal_size().lines < self.MIN_ROWS:
+        if self.plain or not (USE_COLOR and sys.stdin.isatty()) or shutil.get_terminal_size().lines < self.MIN_ROWS:
             return
         self.active = True
         self.history = load_editor_history()
@@ -1179,7 +1336,7 @@ class Screen:
         atexit.register(self.stop)
         try:
             import signal
-            signal.signal(signal.SIGWINCH, lambda *_: self.on_resize())
+            self.resize_handler = signal.signal(signal.SIGWINCH, lambda *_: self.on_resize())
         except (ImportError, AttributeError, ValueError):
             pass
         # Alternate screen (the earlier terminal output stays out of view and comes back on exit),
@@ -1189,9 +1346,13 @@ class Screen:
 
     def _layout(self):
         size = shutil.get_terminal_size()
-        self.w, self.h = size.columns, size.lines
+        self.w, self.h = max(1, size.columns), max(1, size.lines)
         self.header = header_lines(self.agent, self.w, self.h)
         self.top = len(self.header)
+        lines = self.text().count("\n") + 1 if self.reading else 1
+        self.input_rows = max(1, min(lines, 5, self.h - self.top - 7))
+        self.FRAME = 4 + self.input_rows
+        self.extra = min(self.extra, max(0, self.h - self.FRAME - self.top - 3))
         self.bottom = self.h - self.FRAME - self.extra
 
     def _w(self, s):
@@ -1200,27 +1361,35 @@ class Screen:
 
     def draw_header(self):
         self._layout()
+        if self.too_small():
+            return
         out = "\0337"
         for row, line in enumerate(self.header, 1):
-            pad = " " * max(0, (self.w - visible_len(line)) // 2)
-            out += f"\033[{row};1H\033[2K" + self.fit(pad + line)
+            out += f"\033[{row};1H\033[2K" + self.fit(line)
         self._w(out + "\0338")
 
     def redraw_all(self):
         """Redraw everything: banner, the conversation (from the kept copy) and the input box."""
         self._layout()
+        if self.too_small():
+            self._w("\033[r\033[2J\033[H" + clip_ansi("Resize to continue", self.w))
+            return
         self._w("\033[2J" + f"\033[{self.top + 1};{self.bottom}r")
         self.draw_header()
         self.render_view()
         self.draw_frame()
 
+    def too_small(self):
+        return self.h < 8 or self.w < 8
+
     def clear_conversation(self):
         self.rec.clear()
         self.offset, self.gap = 0, False
         self.redraw_all()
+        print("\n".join(welcome_lines(self.agent)))
 
     def on_resize(self):
-        if not self.active:
+        if not self.active or self.choosing:
             return
         self.redraw_all()
         if self.reading:
@@ -1228,6 +1397,8 @@ class Screen:
 
     def grow(self, n):
         """Make the box n rows taller than normal (for the menu); the conversation view shrinks to fit."""
+        if self.too_small():
+            return
         n = max(0, min(n, self.h - self.FRAME - self.top - 3))
         if n == self.extra:
             return
@@ -1242,6 +1413,8 @@ class Screen:
         When showing the newest output (and not at the prompt), leaves the cursor where the
         next output goes, so streaming continues exactly where the copy ends.
         """
+        if self.too_small():
+            return
         height = self.bottom - self.top
         rows = []
         for line in reversed(self.rec.lines + [self.rec.cur]):
@@ -1267,31 +1440,37 @@ class Screen:
         used = a.ctx_used
         pct = round(100 * used / NUM_CTX) if NUM_CTX else 0
         color = green if pct < 50 else yellow if pct < 80 else red
-        parts = [a.model, short_path(a.tools.root),
-                 "Context: " + color(f"{fmt_tokens(used)} / {fmt_tokens(NUM_CTX)} ({pct}%)") + DIM_ON]
-        if a.last_speed:
+        approvals = yellow("auto-approve") if a.tools.auto_approve else green("ask to edit")
+        model = abbreviate(a.model, max(4, self.w // 3))
+        parts = [model, approvals, color(f"ctx {pct}%")]
+        if self.w >= 80:
+            filled = min(8, max(0, round(pct * 8 / 100)))
+            parts[-1] = color("▰" * filled + "▱" * (8 - filled) + f" {pct}% context")
+        if a.last_speed and self.w >= 60:
             parts.append(f"{a.last_speed:.1f} tok/s")
-        return dim("  " + "  |  ".join(parts))
+        return "  " + dim(" · ").join(parts)
 
     def hint_text(self):
         if self.offset:
             return "  " + cyan(f"↑ scrolled back {self.offset} lines") + dim(" · scroll down or PgDn to return")
         if self.agent.tools.auto_approve:
             return "  " + yellow("⏵⏵ auto-approve on") + dim(" (/yolo to turn off)")
-        return dim("  ? /help for commands · /model to switch models · scroll or PgUp to look back")
+        return dim("  / commands · Ctrl-R history · Ctrl-O newline · PgUp scroll")
 
     def fit(self, line):
         """Cut a line to the window width; a line that wraps would spill into the rows below it."""
-        return hard_wrap(line, self.w)[0] + "\033[0m"
+        return clip_ansi(line, self.w) + "\033[0m"
 
     def draw_frame(self, save=True, below=None):
         """Draw the rules and the rows under the prompt (status + hint, or the menu rows passed in)."""
+        if self.too_small():
+            return
         rule = dim("─" * self.w)
         row = self.bottom + 1
         below = below if below is not None else [self.status_text(), self.hint_text()]
-        out = ("\0337" if save else "") + f"\033[{row};1H\033[2K" + rule + f"\033[{row + 2};1H\033[2K" + rule
+        out = ("\0337" if save else "") + f"\033[{row};1H\033[2K" + rule + f"\033[{row + self.input_rows + 1};1H\033[2K" + rule
         for i in range(2 + self.extra):
-            out += f"\033[{row + 3 + i};1H\033[2K" + (self.fit(below[i]) if i < len(below) else "")
+            out += f"\033[{row + self.input_rows + 2 + i};1H\033[2K" + (self.fit(below[i]) if i < len(below) else "")
         self._w(out + ("\0338" if save else ""))
 
     # ---- the line editor
@@ -1309,35 +1488,73 @@ class Screen:
                     self.models = []
             q = t[len("/model "):]
             return [("/model " + m, m, "current" if m == self.agent.model else "")
-                    for m in self.models if m.startswith(q)][:self.MAX_MENU]
+                    for m in self.models if q.casefold() in m.casefold()]
         if t.startswith("/") and " " not in t:
-            return [(c, c, d) for c, d in COMMANDS.items() if c.startswith(t)][:self.MAX_MENU]
+            query = t[1:].casefold()
+            return sorted([(c, c, d) for c, d in COMMANDS.items()
+                           if query in c.casefold() or query in d.casefold()],
+                          key=lambda item: not item[0].startswith(t))
         return []
+
+    def choose(self, rows, start=0, title=""):
+        self.choosing = True
+        try:
+            return pick(rows, start, title)
+        finally:
+            self.choosing = False
+            self.redraw_all()
+
+    def search_history(self):
+        entries = list(dict.fromkeys(reversed(self.history)))
+        if not entries:
+            return None
+        selected = self.choose(entries, title="Prompt history · type to search · Enter returns to editing")
+        return entries[selected] if selected is not None else None
 
     def text(self):
         return "".join(self.buf)
 
     def render(self):
+        previous_rows = self.input_rows
+        self._layout()
+        if previous_rows != self.input_rows:
+            self.redraw_all()
         items = self.menu_items()
+        if self.too_small():
+            return items
         self.sel = min(self.sel, max(0, len(items) - 1))
         self.grow(max(0, len(items) - 2))
         if items:
             width = max(len(label) for _, label, _ in items) + 3
+            count = 2 + self.extra
+            first = max(0, min(self.sel - count + 1, len(items) - count))
             below = [(cyan("  ❯ " + label.ljust(width)) if i == self.sel else "    " + label.ljust(width)) + dim(desc)
-                     for i, (_, label, desc) in enumerate(items)]
+                     for i, (_, label, desc) in enumerate(items) if first <= i < first + count]
         else:
             below = None
         self.draw_frame(save=False, below=below)
-        # The prompt row: scroll horizontally so the cursor stays visible; show newlines as ↵.
-        shown = self.text().replace("\n", "↵")
-        avail = max(10, self.w - 3)
-        start = max(0, self.pos - avail)
+        # A small composer: grow for multiline text, then scroll around the cursor.
+        lines = self.text().split("\n")
+        before = self.text()[:self.pos]
+        cursor_line = before.count("\n")
+        cursor_column = len(before.rsplit("\n", 1)[-1])
+        first_line = max(0, cursor_line - self.input_rows + 1)
+        avail = max(0, self.w - 3)
+        start = cursor_column
+        while start and visible_len(lines[cursor_line][start - 1:cursor_column]) <= avail:
+            start -= 1
         row = self.bottom + 2
-        if shown:
-            line = cyan("❯ ") + shown[start:start + avail]
-        else:
-            line = cyan("❯ ") + dim(PLACEHOLDER)
-        self._w(f"\033[{row};1H\033[2K" + line + f"\033[{row};{3 + self.pos - start}H")
+        out = ""
+        for i in range(self.input_rows):
+            number = first_line + i
+            text = lines[number] if number < len(lines) else ""
+            shift = start if number == cursor_line else 0
+            line = cyan("❯ " if number == 0 else "· ") + clip_ansi(text[shift:], avail)
+            if not self.text():
+                line = cyan("❯ ") + dim(PLACEHOLDER)
+            out += f"\033[{row + i};1H\033[2K" + self.fit(line)
+        cursor = min(self.w, 3 + visible_len(lines[cursor_line][start:cursor_column]))
+        self._w(out + f"\033[{row + cursor_line - first_line};{cursor}H")
         return items
 
     def read_line(self):
@@ -1355,6 +1572,11 @@ class Screen:
         decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
 
         self.buf, self.pos, self.sel, self.menu_closed, self.in_paste = [], 0, 0, False, False
+        if self.prefill:
+            self.buf, self.pos = list(self.prefill), len(self.prefill)
+            self.prefill = ""
+            self.menu_closed = True
+        self.models = None  # refresh installed model suggestions for each new entry
         hist_i, draft = len(self.history), ""
         self._w("\033[?2004h")  # bracketed paste, so multi-line pastes arrive as one piece
         self.reading = True
@@ -1364,13 +1586,32 @@ class Screen:
         try:
             items = self.render()
             while result is None:
-                data = pending + decoder.decode(os.read(fd, 4096))
+                chunk = os.read(fd, 4096)
+                if not chunk:
+                    result = EOFError()
+                    break
+                data = pending + decoder.decode(chunk)
                 pending = ""
                 if data == "\x1b" and select.select([fd], [], [], 0.03)[0]:
                     pending = data  # the rest of an escape sequence is on its way
                     continue
                 i = 0
                 while i < len(data) and result is None:
+                    # Escape sequences and paste delimiters can span arbitrary reads.
+                    tail = data[i:]
+                    if self.in_paste:
+                        marker = "\x1b[201~"
+                        if marker not in tail:
+                            keep = next((n for n in range(min(len(tail), len(marker) - 1), 0, -1)
+                                         if tail.endswith(marker[:n])), 0)
+                            if keep:
+                                pending = tail[-keep:]
+                                data = data[:-keep]
+                                if i == len(data):
+                                    break
+                    elif tail.startswith("\x1b[") and not re.search(r"[@-~]", tail[2:]):
+                        pending = tail
+                        break
                     key, i = self._next_key(data, i)
                     if key in self.SCROLL_KEYS:
                         self.scroll(self.SCROLL_KEYS[key] * (max(1, self.bottom - self.top - 2) if key.startswith("page") else 1))
@@ -1378,17 +1619,16 @@ class Screen:
                         continue
                     result = self._handle_key(key, items)
                     if result is None:
-                        if key in ("up", "down") and not items:
+                        if key in ("up", "down") and not items and "\n" not in self.text():
                             hist_i, draft = self._history_step(key, hist_i, draft)
                         items = self.render()
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, saved_tty)
             self.reading = False
             self.offset = 0
-            self.grow(0)
-            self.draw_frame(save=False)
-            self._w(f"\033[{self.bottom + 2};1H\033[2K" + "\033[?2004l")
-            self.render_view()  # back to the newest output, cursor where the next output goes
+            self.extra = 0
+            self._w("\033[?2004l")
+            self.redraw_all()  # shrink the composer and return to the newest output
         if isinstance(result, BaseException):
             raise result
         if result and (not self.history or self.history[-1] != result):
@@ -1442,6 +1682,15 @@ class Screen:
             text = key[1].replace("\r\n", "\n").replace("\r", "\n")
             buf[pos:pos] = list(text)
             self.pos += len(text)
+        elif key == "\x12":  # Ctrl-R: select a past prompt, then keep editing
+            text = self.search_history()
+            if text is not None:
+                self.buf, self.pos = list(text), len(text)
+                self.menu_closed = True
+            return None
+        elif key == "\x0f":  # Ctrl-O inserts without sending
+            buf.insert(pos, "\n")
+            self.pos += 1
         elif key in ("\r", "\n"):
             if items:
                 return items[self.sel][0]
@@ -1457,6 +1706,12 @@ class Screen:
         elif key in ("up", "down") and items:
             self.sel = (self.sel + (1 if key == "down" else -1)) % len(items)
             return None
+        elif key in ("up", "down") and "\n" in before:
+            lines = before.split("\n")
+            current = before[:pos].count("\n")
+            column = len(before[:pos].rsplit("\n", 1)[-1])
+            target = max(0, min(len(lines) - 1, current + (1 if key == "down" else -1)))
+            self.pos = sum(len(line) + 1 for line in lines[:target]) + min(column, len(lines[target]))
         elif key == "esc":
             self.menu_closed = True
             return None
@@ -1481,9 +1736,10 @@ class Screen:
         elif key in ("right", "\x06"):
             self.pos = min(len(buf), pos + 1)
         elif key in ("home", "\x01"):
-            self.pos = 0
+            self.pos = before.rfind("\n", 0, pos) + 1
         elif key in ("end", "\x05"):
-            self.pos = len(buf)
+            end = before.find("\n", pos)
+            self.pos = len(buf) if end == -1 else end
         elif key == "\x15":  # Ctrl-U
             del buf[:pos]
             self.pos = 0
@@ -1537,6 +1793,10 @@ class Screen:
             return
         self.active = False
         sys.stdout = self.raw
+        if self.resize_handler is not None:
+            import signal
+            signal.signal(signal.SIGWINCH, self.resize_handler)
+            self.resize_handler = None
         try:
             EDITOR_HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
             EDITOR_HISTORY_PATH.write_text("".join(json.dumps(h) + "\n" for h in self.history[-HISTORY_LENGTH:]))
@@ -1552,12 +1812,19 @@ def main():
     ap.add_argument("-m", "--model", help="model to use (default: last one picked, else " + DEFAULT_MODEL + ")")
     ap.add_argument("-C", "--cwd", default=".", help="project directory")
     ap.add_argument("--yolo", action="store_true", help="auto-approve writes and shell commands")
+    ap.add_argument("--plain", action="store_true", help="use inline prompts instead of the full-screen interface")
+    ap.add_argument("--version", action="version", version="%(prog)s " + VERSION)
     args = ap.parse_args()
+    root = Path(args.cwd).expanduser().resolve()
+    if not root.is_dir():
+        ap.error(f"project directory does not exist or is not a directory: {root}")
 
     try:
         installed = list_models()
     except (urllib.error.URLError, OSError):
-        sys.exit(red(f"Can't reach Ollama at {OLLAMA_HOST}. Start it with `ollama serve`."))
+        sys.exit(red(f"Can't reach Ollama at {OLLAMA_HOST}.") +
+                 "\nOpen the Ollama app on your Mac, or run `ollama serve`." +
+                 "\nFor another server, set OLLAMA_HOST to its address.")
     if not installed:
         sys.exit(red(f"No models installed. Try `ollama pull {DEFAULT_MODEL}`."))
     # -m flag, then LOCALCODE_MODEL, then the model picked last time, then the built-in default
@@ -1571,69 +1838,95 @@ def main():
             return
         save_state(model=model)
 
-    tools = Tools(args.cwd, auto_approve=args.yolo)
+    tools = Tools(root, auto_approve=args.yolo)
     agent = Agent(model, tools)
 
     if args.prompt:
         agent.run(" ".join(args.prompt))
         return
 
-    screen = Screen(agent)
-    screen.start()
-    agent.show_stats = not screen.active  # the status line shows them instead
-    if not screen.active:
-        setup_readline()  # plain-prompt fallback: readline's editing and history
-        print(bold("localcode") + dim(f"  {agent.model}  ·  {tools.root}  ·  /help for commands"))
-        print(instructions_status(agent.instructions))
-    while True:
-        try:
-            text = read_input(screen)
-        except (EOFError, KeyboardInterrupt):
-            print()
-            return
-        if not text:
-            continue
-        if screen.active:
-            print()
-        if text.startswith("/"):
-            cmd, _, rest = text.partition(" ")
-            if cmd in ("/exit", "/quit"):
+    screen = Screen(agent, plain=args.plain)
+    try:
+        screen.start()
+        agent.show_stats = not screen.active  # the status line shows them instead
+        if not screen.active:
+            setup_readline()  # plain-prompt fallback: readline's editing and history
+            print(bold("localcode") + dim(f"  {agent.model}  ·  {tools.root}  ·  /help for commands"))
+        print("\n".join(welcome_lines(agent)))
+        while True:
+            try:
+                text = read_input(screen)
+            except (EOFError, KeyboardInterrupt):
+                print()
                 return
-            elif cmd == "/help":
-                print(HELP)
-            elif cmd == "/clear":
-                agent.reset()
-                if screen.active:
-                    screen.clear_conversation()
-                else:
-                    print(dim("Conversation cleared. ") + instructions_status(agent.instructions))
-            elif cmd in ("/model", "/models"):
-                name = rest.strip()
-                if not name:
-                    name = pick_model(agent.model)
-                elif name not in list_models():
-                    print(red(f"{name} isn't installed.") + dim(" Run /model to pick from the installed ones."))
+            if not text:
+                continue
+            if screen.active:
+                print()
+            try:
+                if text.startswith("/"):
+                    cmd, _, rest = text.partition(" ")
+                    if cmd in ("/exit", "/quit"):
+                        return
+                    elif cmd == "/help":
+                        print(HELP)
+                    elif cmd == "/status":
+                        show_status(agent)
+                    elif cmd == "/copy":
+                        copy_reply(agent)
+                        print(green("Copied the last reply to your clipboard."))
+                    elif cmd == "/export":
+                        path = export_conversation(agent, rest)
+                        print(green(f"Conversation saved to {path}"))
+                    elif cmd == "/history":
+                        if screen.active:
+                            selected = screen.search_history()
+                            if selected is not None:
+                                screen.prefill = selected
+                        else:
+                            entries = list(dict.fromkeys(reversed(load_editor_history())))
+                            choice = pick(entries, title="Prompt history")
+                            if choice is not None:
+                                print(bold("Selected prompt (copy to edit):") + "\n" + entries[choice])
+                    elif cmd == "/clear":
+                        agent.reset()
+                        if screen.active:
+                            screen.clear_conversation()
+                        else:
+                            print(dim("Conversation cleared. ") + instructions_status(agent.instructions))
+                    elif cmd in ("/model", "/models"):
+                        name = rest.strip()
+                        if not name:
+                            name = pick_model(agent.model, chooser=screen.choose if screen.active else pick)
+                        elif name not in list_models():
+                            print(red(f"{name} isn't installed.") + dim(" Run /model to pick from the installed ones."))
+                            continue
+                        if name and name != agent.model:
+                            agent.model = name
+                            save_state(model=name)
+                            if screen.active:
+                                screen.draw_header()
+                            print(dim("Switched to ") + bold(name) + dim(". The conversation carries over; /clear to start fresh."))
+                        else:
+                            print(dim(f"Model: {agent.model}"))
+                    elif cmd == "/yolo":
+                        tools.auto_approve = not tools.auto_approve
+                        print(dim(f"Auto-approve {'on' if tools.auto_approve else 'off'}."))
+                    else:
+                        print(red("Unknown command.") + " " + HELP)
                     continue
-                if name and name != agent.model:
-                    agent.model = name
-                    save_state(model=name)
-                    if screen.active:
-                        screen.draw_header()
-                    print(dim("Switched to ") + bold(name) + dim(". The conversation carries over; /clear to start fresh."))
-                else:
-                    print(dim(f"Model: {agent.model}"))
-            elif cmd == "/yolo":
-                tools.auto_approve = not tools.auto_approve
-                print(dim(f"Auto-approve {'on' if tools.auto_approve else 'off'}."))
-            else:
-                print(red("Unknown command.") + " " + HELP)
-            continue
-        try:
-            agent.run(text)
-        except KeyboardInterrupt:
-            print(yellow("\nInterrupted."))
-        except (urllib.error.URLError, RuntimeError) as e:
-            print(red(f"Model error: {e}"))
+            except (urllib.error.URLError, OSError, ValueError) as e:
+                print(red(f"Command failed: {e}") + dim(" Try again, or /exit to quit."))
+                continue
+            try:
+                agent.run(text)
+            except KeyboardInterrupt:
+                print(yellow("\nInterrupted."))
+            except (urllib.error.URLError, RuntimeError) as e:
+                print(red(f"Model error: {e}"))
+
+    finally:
+        screen.stop()
 
 
 if __name__ == "__main__":
