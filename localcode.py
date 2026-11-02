@@ -36,7 +36,7 @@ OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/"
 if not OLLAMA_HOST.startswith("http"):
     OLLAMA_HOST = "http://" + OLLAMA_HOST
 DEFAULT_MODEL = "gpt-oss:20b"
-VERSION = "0.6.1"
+VERSION = "0.6.2"
 NUM_CTX = int(os.environ.get("LOCALCODE_NUM_CTX", "32768"))
 MAX_STEPS = 40
 SHOW_THINKING = os.environ.get("LOCALCODE_SHOW_THINKING") == "1"  # else collapsed to "Thought for Ns"
@@ -100,7 +100,7 @@ class Spinner:
         i = 0
         while not self.done.wait(0.1):
             elapsed = int(time.monotonic() - start)
-            self._write("\r" + dim(f"{self.FRAMES[i % len(self.FRAMES)]} {self.label}… {elapsed}s"))
+            self._write("\r" + dim(f"{self.FRAMES[i % len(self.FRAMES)]} {self.label}… {elapsed}s") + "\033[K")
             i += 1
         self._write("\r\033[K")
 
@@ -684,18 +684,18 @@ class Tools:
             return f"Error: {path} is not a file"
         offset = max(1, int(offset or 1))
         mtime = p.stat().st_mtime
-        if self.seen.get((p, offset), (None,))[0] == mtime:
-            end = self.seen[(p, offset)][1]
-            return (f"You already read lines {offset}-{end} of {self.rel(p)} earlier in this conversation "
-                    "and the file hasn't changed since. Use that output instead of reading it again.")
         lines = p.read_text(errors="replace").splitlines()
         if not lines:
             return "(empty file)"
         if offset > len(lines):
             return f"Error: offset {offset} is past the end ({len(lines)} lines)"
+        stop = len(lines) if not limit else min(len(lines), offset - 1 + int(limit))
+        seen_mtime, seen_end, seen_stop = self.seen.get((p, offset), (None, 0, 0))
+        if seen_mtime == mtime and seen_stop >= stop:  # an earlier read already asked for at least this much
+            return (f"You already read lines {offset}-{seen_end} of {self.rel(p)} earlier in this conversation "
+                    "and the file hasn't changed since. Use that output instead of reading it again.")
         # Fill up to the character budget on whole lines, so results are never cut mid-line.
         out, used, end = [], 0, offset - 1
-        stop = len(lines) if not limit else min(len(lines), offset - 1 + int(limit))
         for i in range(offset - 1, stop):
             row = f"{i + 1:5}| {lines[i]}"
             if out and used + len(row) + 1 > budget:
@@ -703,7 +703,7 @@ class Tools:
             out.append(row)
             used += len(row) + 1
             end = i + 1
-        self.seen[(p, offset)] = (mtime, end)
+        self.seen[(p, offset)] = (mtime, end, stop)
         text = "\n".join(out)
         if end < len(lines):
             text += (f"\n... showing lines {offset}-{end} of {len(lines)}. "
@@ -743,6 +743,8 @@ class Tools:
         text = p.read_text(errors="replace")
         count = text.count(old_string)
         if count == 0:
+            # The model is told to read the file again, so the repeat-read guard mustn't refuse it.
+            self.seen = {k: v for k, v in self.seen.items() if k[0] != p}
             return ("Error: old_string not found. Read the file again and copy the exact text, "
                     "including whitespace and indentation (without the line-number prefix).")
         if count > 1 and not replace_all:
@@ -1013,7 +1015,31 @@ def parse_text_tool_calls(text):
                 except json.JSONDecodeError:
                     continue
             calls.append({"function": {"name": obj["name"], "arguments": args}})
-    return calls
+    return calls or unnamed_tool_call(text)
+
+
+def bare_json_object(text):
+    """The JSON object a reply consists of (optionally in a code fence), or None."""
+    body = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip())
+    try:
+        obj = json.loads(body)
+    except json.JSONDecodeError:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def unnamed_tool_call(text):
+    """A reply that is only a tool's arguments, like {"path": "a.py", "offset": 1, "limit": 200}: run it when
+    exactly one tool takes those arguments."""
+    args = bare_json_object(text)
+    if not args:
+        return []
+    fits = [t["function"]["name"] for t in TOOL_SCHEMAS
+            if set(args) <= set(t["function"]["parameters"]["properties"])
+            and set(t["function"]["parameters"]["required"]) <= set(args)]
+    if len(fits) != 1:
+        return []
+    return [{"function": {"name": fits[0], "arguments": args}}]
 
 
 class Agent:
@@ -1083,10 +1109,19 @@ class Agent:
 
     def run(self, user_input):
         self.messages.append({"role": "user", "content": user_input})
+        nudged = False
         for _ in range(MAX_STEPS):
             content, tool_calls, native = self.chat_once()
             self.messages.append({"role": "assistant", "content": content,
                                   **({"tool_calls": tool_calls} if native else {})})
+            if not tool_calls and not nudged and bare_json_object(content) is not None:
+                # Looks like a tool call with no tool name; ask once rather than stopping silently.
+                nudged = True
+                print(dim("  └ that looked like a tool call without a tool name; asking the model to retry"))
+                self.messages.append({"role": "user", "content": (
+                    "Your last message was only JSON, with no tool name, so no tool ran. To use a tool, call it "
+                    f"by name ({', '.join(TOOL_NAMES)}). Otherwise, reply to me in plain text.")})
+                continue
             if not tool_calls:
                 return
             for call in tool_calls:

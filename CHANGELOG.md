@@ -2,6 +2,13 @@
 
 Each version is a git tag. `localcode --version`, the header and `/status` show the version you're running.
 
+## v0.6.2 — 2026-11-02
+
+- After a failed `edit_file`, reading that file again returns its text instead of "you already read this", so the model can copy the exact text and retry.
+- The repeat-read guard only refuses a read that asks for no more than an earlier one; asking for more lines (a bigger `limit`) is answered.
+- A reply that is only a tool's arguments with no tool name runs that tool when exactly one tool fits. Otherwise localcode asks the model once to retry, instead of ending the turn silently.
+- The spinner clears the rest of its line, so switching from "waiting for model" to "thinking" leaves no leftover text.
+
 ## v0.6.1 — 2026-11-02
 
 - Approval prompts keep the mouse wheel and PgUp/PgDn inside localcode, so you can scroll back through a long diff before answering. Previously the terminal scrolled its own history instead and the prompt went out of view.

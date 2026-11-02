@@ -202,6 +202,88 @@ class TerminalTextTests(unittest.TestCase):
             self.assertLessEqual(lc.visible_len(screen.fit(screen.status_text())), width)
 
 
+class StuckModelTests(unittest.TestCase):
+    """Loops a model fell into: refused re-reads after a failed edit, nameless tool calls, spinner leftovers."""
+
+    def test_repeat_read_guard_only_refuses_what_was_already_shown(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "notes.md"
+            path.write_text("".join(f"line {i}\n" for i in range(1, 121)))
+            tools = lc.Tools(directory)
+            self.assertIn("showing lines 1-50 of 120", tools.read_file("notes.md", limit=50))
+            self.assertTrue(tools.read_file("notes.md", limit=50).startswith("You already read lines 1-50"))
+            self.assertTrue(tools.read_file("notes.md", limit=20).startswith("You already read lines 1-50"))
+            wider = tools.read_file("notes.md", limit=200)  # asking for more than before is answered
+            self.assertIn("  120| line 120", wider)
+            self.assertTrue(tools.read_file("notes.md").startswith("You already read lines 1-120"))
+            path.write_text("".join(f"row {i}\n" for i in range(3000)))
+            first = tools.read_file("notes.md")
+            self.assertIn("Call read_file with offset=", first)
+            self.assertTrue(tools.read_file("notes.md").startswith("You already read lines 1-"))
+
+    def test_failed_edit_lets_the_file_be_read_again(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "README.md").write_text("# Title\n\nOld text here.\n")
+            (Path(directory) / "other.md").write_text("other\n")
+            tools = lc.Tools(directory, auto_approve=True)
+            tools.read_file("README.md")
+            tools.read_file("other.md")
+            self.assertTrue(tools.read_file("README.md").startswith("You already read"))
+            self.assertIn("old_string not found", tools.edit_file("README.md", "Old txt", "New text"))
+            self.assertIn("    3| Old text here.", tools.read_file("README.md"))
+            self.assertTrue(tools.read_file("other.md").startswith("You already read"))  # other files untouched
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(tools.edit_file("README.md", "Old text", "New text"), "Edited README.md")
+            self.assertIn("New text here.", tools.read_file("README.md"))
+
+    def test_tool_arguments_without_a_name(self):
+        call = lc.parse_text_tool_calls('{"limit":200,"offset":1,"path":"ceng/README.md"}')
+        self.assertEqual(call, [{"function": {"name": "read_file",
+                                              "arguments": {"limit": 200, "offset": 1, "path": "ceng/README.md"}}}])
+        self.assertEqual(lc.parse_text_tool_calls('```json\n{"pattern": "weekly", "include": "*.md"}\n```')[0]
+                         ["function"]["name"], "grep")
+        self.assertEqual(lc.parse_text_tool_calls('{"url": "https://example.com"}')[0]["function"]["name"], "web_fetch")
+        for text in ('{"path": "a.py"}', '{"pattern": "*.md", "path": "docs"}',  # fit two tools: don't guess
+                     '{"query": "weekly"}', '{}', '["a"]', 'Here are the args: {"path": "a.py", "offset": 1}',
+                     '{"path": "a.py", "offset": 1} and more'):
+            self.assertEqual(lc.parse_text_tool_calls(text), [], text)
+        named = lc.parse_text_tool_calls('{"name": "list_dir", "arguments": {"path": "."}}')
+        self.assertEqual(named[0]["function"]["name"], "list_dir")
+
+    def test_nameless_json_reply_is_retried_once_instead_of_stopping(self):
+        def agent_with(replies):
+            replies = iter(replies)
+            agent = lc.Agent("example", lc.Tools(tempfile.gettempdir()))
+            fake = lambda path, payload=None, stream=False: iter([{"message": {"content": next(replies)}},
+                                                                  {"done": True}])
+            return agent, fake
+
+        agent, fake = agent_with(['{"query": "weekly"}', "Sorry, here is the answer."])
+        with patch.object(lc, "ollama", fake), contextlib.redirect_stdout(io.StringIO()) as out:
+            agent.run("find it")
+        self.assertIn("without a tool name", out.getvalue())
+        self.assertIn("no tool name", agent.messages[-2]["content"])
+        self.assertEqual(agent.messages[-1]["content"], "Sorry, here is the answer.")
+
+        agent, fake = agent_with(['{"query": "weekly"}', '{"query": "again"}'])
+        with patch.object(lc, "ollama", fake), contextlib.redirect_stdout(io.StringIO()) as out:
+            agent.run("find it")  # a second nameless reply ends the turn rather than looping
+        self.assertEqual(out.getvalue().count("without a tool name"), 1)
+        self.assertEqual([m["role"] for m in agent.messages[-4:]], ["user", "assistant", "user", "assistant"])
+
+    def test_spinner_clears_what_a_longer_label_left(self):
+        out = io.StringIO()
+        out.isatty = lambda: True
+        with patch.object(lc.sys, "stdout", out):
+            spinner = lc.Spinner("thinking")
+            import time
+            time.sleep(0.25)
+            spinner.stop()
+        frames = [f for f in out.getvalue().split("\r") if f]
+        self.assertTrue(frames)
+        self.assertTrue(all(f.endswith("\033[K") for f in frames), frames)
+
+
 class AutoModeTests(unittest.TestCase):
     """/auto approves what is clearly safe and still asks about everything else."""
 
