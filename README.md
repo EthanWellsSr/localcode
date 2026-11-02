@@ -95,7 +95,7 @@ The model picker is searchable too: type part of a name, parameter size, or `nat
 | Mouse wheel, PgUp/PgDn, Shift+↑/↓ | Scroll back through the conversation |
 | ↑/↓ | Step through past entries (saved across sessions in `~/.config/localcode/history.jsonl`) |
 | Ctrl-R | Search prompt history and return a selection to the editor without sending it |
-| Ctrl-O | Insert a newline; the composer grows to five lines and scrolls for longer prompts |
+| Shift+Enter | Insert a newline; Enter sends. Long lines wrap below automatically; the composer grows to five rows, then scrolls vertically |
 | ↑/↓ in a multiline draft | Move between lines; Ctrl-A / Ctrl-E moves to the start/end of the current line |
 | `\` then Enter | Start a new line; pasting multi-line text also works |
 | Ctrl-C | Clear the line; on an empty line, quit |
@@ -105,6 +105,8 @@ The model picker is searchable too: type part of a name, parameter size, or `nat
 The model you pick is remembered for next time (in `~/.config/localcode/state.json`); switching keeps the conversation.
 
 ## Keep useful work
+
+Shift+Enter uses the terminal’s [extended keyboard protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/). If your terminal sends the same code for Enter and Shift+Enter, configure Shift+Enter to send `\x1b[13;2u` (hex `1b 5b 31 33 3b 32 75`) or LF (`0a`). Backslash followed by Enter also inserts a newline.
 
 Use Ctrl-R to find a previous prompt by a few words. Select it, revise it in the composer, then press Enter when ready. Cancelling keeps your current draft. In `--plain` mode, `/history` offers numbered selection and prints the chosen prompt for copying; readline also provides your shell's usual history search.
 

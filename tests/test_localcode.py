@@ -55,6 +55,7 @@ class TerminalTextTests(unittest.TestCase):
 
     def test_multiline_editor_moves_between_lines_without_sending(self):
         screen = lc.Screen(lc.Agent("example", lc.Tools(tempfile.gettempdir())))
+        screen.w = 80
         screen.buf, screen.pos, screen.menu_closed = list("first"), 5, False
         self.assertIsNone(screen._handle_key("\x0f", []))
         screen._handle_key(("paste", "second"), [])
@@ -66,6 +67,67 @@ class TerminalTextTests(unittest.TestCase):
         self.assertEqual(screen.pos, 6)
         screen._handle_key("end", [])
         self.assertEqual(screen._handle_key("\r", []), "first\nsecond")
+
+    def composer(self, text, width=20, pos=None):
+        screen = lc.Screen(lc.Agent("example", lc.Tools(tempfile.gettempdir())))
+        screen.raw = io.StringIO()
+        screen.rec = lc.Transcript(screen.raw)
+        screen.buf, screen.pos = list(text), len(text) if pos is None else pos
+        screen.sel, screen.menu_closed, screen.in_paste = 0, True, False
+        screen.reading = True
+        with patch.object(lc.shutil, "get_terminal_size", return_value=os.terminal_size((width, 24))):
+            screen.render()
+        return screen
+
+    def test_long_draft_wraps_below_without_losing_start(self):
+        screen = self.composer("abcdefghijklmnopqrstuvwxy")
+        self.assertEqual(screen.input_rows, 2)
+        output = lc.ANSI_RE.sub("", screen.raw.getvalue())
+        self.assertIn("abcdefghijklmnopq", output)
+        self.assertIn("rstuvwxy", output)
+        self.assertEqual(screen.text(), "abcdefghijklmnopqrstuvwxy")
+
+    def test_shift_enter_inserts_newline_without_submitting(self):
+        for sequence in ("\x1b[13;2u", "\x1b[27;2;13~", "\x1b\r", "\n"):
+            screen = self.composer("first")
+            key, consumed = screen._next_key(sequence, 0)
+            self.assertEqual(consumed, len(sequence))
+            self.assertIsNone(screen._handle_key(key, []))
+            screen._handle_key(("paste", "second"), [])
+            self.assertEqual(screen.text(), "first\nsecond")
+            self.assertEqual(screen._handle_key("\r", []), "first\nsecond")
+
+    def test_wrapped_draft_navigation_resize_and_vertical_scroll(self):
+        text = "abcdefghijklmnopqrstuvwxy"
+        screen = self.composer(text)
+        screen._handle_key("up", [])
+        self.assertEqual(screen.pos, 8)
+        screen._handle_key("down", [])
+        self.assertEqual(screen.pos, len(text))
+        screen = self.composer("项目 cafe\u0301" * 12)
+        self.assertEqual(screen.input_rows, 5)
+        original = screen.text()
+        screen.pos = 0
+        with patch.object(lc.shutil, "get_terminal_size", return_value=os.terminal_size((80, 24))):
+            screen.render()
+        self.assertLess(screen.input_rows, 5)
+        self.assertEqual(screen.text(), original)
+        rows, _ = screen.composer_rows()
+        for start, end in rows:
+            self.assertLessEqual(lc.visible_len(original[start:end]), 77)
+
+    def test_exact_wrap_boundary_and_explicit_blank_lines(self):
+        screen = self.composer("a" * 17)
+        self.assertEqual(screen.composer_rows(), ([(0, 17), (17, 17)], 1))
+        screen = self.composer("first\n\nlast")
+        self.assertEqual(screen.input_rows, 3)
+        self.assertEqual(screen.composer_rows()[0], [(0, 5), (6, 6), (7, 11)])
+
+    def test_extended_keyboard_control_keys(self):
+        screen = self.composer("")
+        for sequence, expected in (("\x1b[114;5u", "\x12"), ("\x1b[99;5u", "\x03"),
+                                   ("\x1b[13u", "\r"), ("\x1b[13;2:3u", "unknown")):
+            self.assertEqual(screen._next_key(sequence, 0), (expected, len(sequence)))
 
     def test_unicode_fits_terminal_cells(self):
         text = "\033[36m项目 cafe\u0301\033[0m"
@@ -218,11 +280,15 @@ lc.main()
             try:
                 wait_for("Ask about this project")
                 # Split both CSI opening and closing paste markers across reads.
-                for chunk in (b"\x1b[20", b"0~", "项目\nhello".encode(), b"\x1b[20", b"1~"):
+                for chunk in (b"\x1b[20", b"0~", "项目".encode(), b"\x1b[20", b"1~"):
+                    os.write(master, chunk)
+                    time.sleep(0.05)
+                for chunk in (b"\x1b[13;", b"2u", b"hello"):
                     os.write(master, chunk)
                     time.sleep(0.05)
                 os.write(master, b"\r")
                 wait_for("Received:")
+                wait_for("\x1b[?2004h")
                 os.write(master, b"/status\r")
                 wait_for("Allowed this session")
                 wait_for("\x1b[?2004h")
@@ -263,6 +329,7 @@ lc.main()
                 original[3] &= ~pending_input
                 self.assertEqual(restored, original)
                 self.assertNotIn(b"Traceback", output)
+                self.assertEqual(output.count(b"\x1b[>1u"), output.count(b"\x1b[<u"))
                 history = json.loads((Path(directory) / "localcode/history.jsonl").read_text().splitlines()[0])
                 self.assertEqual(history, "项目\nhello")
                 entries = [json.loads(line) for line in (Path(directory) / "localcode/history.jsonl").read_text().splitlines()]

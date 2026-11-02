@@ -861,7 +861,7 @@ Keys:
   ↑/↓        step through past entries
   PgUp/PgDn  scroll the conversation (mouse wheel also works)
   Ctrl-R     search prompt history without sending it
-  Ctrl-O     insert a new line (Enter sends)
+  Shift-Enter insert a new line (Enter sends)
   Ctrl-D     quit on an empty line
   \\ + Enter  start a new line
   Ctrl-C     clear the line; on an empty line, quit"""
@@ -1349,7 +1349,7 @@ class Screen:
         self.w, self.h = max(1, size.columns), max(1, size.lines)
         self.header = header_lines(self.agent, self.w, self.h)
         self.top = len(self.header)
-        lines = self.text().count("\n") + 1 if self.reading else 1
+        lines = len(self.composer_rows()[0]) if self.reading else 1
         self.input_rows = max(1, min(lines, 5, self.h - self.top - 7))
         self.FRAME = 4 + self.input_rows
         self.extra = min(self.extra, max(0, self.h - self.FRAME - self.top - 3))
@@ -1455,7 +1455,7 @@ class Screen:
             return "  " + cyan(f"↑ scrolled back {self.offset} lines") + dim(" · scroll down or PgDn to return")
         if self.agent.tools.auto_approve:
             return "  " + yellow("⏵⏵ auto-approve on") + dim(" (/yolo to turn off)")
-        return dim("  / commands · Ctrl-R history · Ctrl-O newline · PgUp scroll")
+        return dim("  / commands · Ctrl-R history · Shift-Enter newline · PgUp scroll")
 
     def fit(self, line):
         """Cut a line to the window width; a line that wraps would spill into the rows below it."""
@@ -1498,9 +1498,13 @@ class Screen:
 
     def choose(self, rows, start=0, title=""):
         self.choosing = True
+        if self.reading:
+            self._w("\033[<u")  # picker uses legacy key sequences
         try:
             return pick(rows, start, title)
         finally:
+            if self.reading:
+                self._w("\033[>1u")
             self.choosing = False
             self.redraw_all()
 
@@ -1513,6 +1517,27 @@ class Screen:
 
     def text(self):
         return "".join(self.buf)
+
+    def composer_rows(self):
+        """Visual rows as buffer ranges, sharing wrapping with layout and navigation."""
+        width = max(1, self.w - 3)  # prompt prefix plus one cell for the cursor
+        rows, start, cells = [], 0, 0
+        for i, ch in enumerate(self.buf):
+            if ch == "\n":
+                rows.append((start, i))
+                start, cells = i + 1, 0
+                continue
+            size = char_width(ch)
+            if cells and cells + size > width:
+                rows.append((start, i))
+                start, cells = i, 0
+            cells += size
+        rows.append((start, len(self.buf)))
+        # At an exact boundary, put the insertion cursor on the following row.
+        if cells >= width:
+            rows.append((len(self.buf), len(self.buf)))
+        current = max(i for i, (start, _) in enumerate(rows) if start <= self.pos)
+        return rows, current
 
     def render(self):
         previous_rows = self.input_rows
@@ -1533,27 +1558,19 @@ class Screen:
         else:
             below = None
         self.draw_frame(save=False, below=below)
-        # A small composer: grow for multiline text, then scroll around the cursor.
-        lines = self.text().split("\n")
-        before = self.text()[:self.pos]
-        cursor_line = before.count("\n")
-        cursor_column = len(before.rsplit("\n", 1)[-1])
+        rows, cursor_line = self.composer_rows()
         first_line = max(0, cursor_line - self.input_rows + 1)
-        avail = max(0, self.w - 3)
-        start = cursor_column
-        while start and visible_len(lines[cursor_line][start - 1:cursor_column]) <= avail:
-            start -= 1
         row = self.bottom + 2
         out = ""
         for i in range(self.input_rows):
             number = first_line + i
-            text = lines[number] if number < len(lines) else ""
-            shift = start if number == cursor_line else 0
-            line = cyan("❯ " if number == 0 else "· ") + clip_ansi(text[shift:], avail)
+            start, end = rows[number] if number < len(rows) else (0, 0)
+            line = cyan("❯ " if number == 0 else "· ") + self.text()[start:end]
             if not self.text():
                 line = cyan("❯ ") + dim(PLACEHOLDER)
             out += f"\033[{row + i};1H\033[2K" + self.fit(line)
-        cursor = min(self.w, 3 + visible_len(lines[cursor_line][start:cursor_column]))
+        start, _ = rows[cursor_line]
+        cursor = min(self.w, 3 + visible_len(self.text()[start:self.pos]))
         self._w(out + f"\033[{row + cursor_line - first_line};{cursor}H")
         return items
 
@@ -1578,9 +1595,12 @@ class Screen:
             self.menu_closed = True
         self.models = None  # refresh installed model suggestions for each new entry
         hist_i, draft = len(self.history), ""
-        self._w("\033[?2004h")  # bracketed paste, so multi-line pastes arrive as one piece
+        # Request unambiguous modified keys in terminals with the kitty protocol.
+        # Restore the previous keyboard mode when leaving the editor.
+        self._w("\033[>1u")
         self.reading = True
         termios.tcsetattr(fd, termios.TCSADRAIN, raw)
+        self._w("\033[?2004h")  # bracketed paste; also signals that input is ready
         result = None
         pending = ""
         try:
@@ -1619,7 +1639,7 @@ class Screen:
                         continue
                     result = self._handle_key(key, items)
                     if result is None:
-                        if key in ("up", "down") and not items and "\n" not in self.text():
+                        if key in ("up", "down") and not items and len(self.composer_rows()[0]) == 1:
                             hist_i, draft = self._history_step(key, hist_i, draft)
                         items = self.render()
         finally:
@@ -1627,7 +1647,7 @@ class Screen:
             self.reading = False
             self.offset = 0
             self.extra = 0
-            self._w("\033[?2004l")
+            self._w("\033[<u\033[?2004l")
             self.redraw_all()  # shrink the composer and return to the newest output
         if isinstance(result, BaseException):
             raise result
@@ -1667,12 +1687,26 @@ class Screen:
             names = {"A": "up", "B": "down", "C": "right", "D": "left", "H": "home", "F": "end",
                      "1~": "home", "7~": "home", "4~": "end", "8~": "end", "3~": "delete",
                      "1;3D": "wordleft", "1;5D": "wordleft", "1;3C": "wordright", "1;5C": "wordright",
-                     "5~": "pageup", "6~": "pagedown", "1;2A": "lineup", "1;2B": "linedown"}
+                     "5~": "pageup", "6~": "pagedown", "1;2A": "lineup", "1;2B": "linedown",
+                     "27;2;13~": "newline", "13;2~": "newline"}
+            extended = re.fullmatch(r"(\d+)(?:;(\d+)(?::(\d+))?)?u", seq)
+            if extended:
+                code, modifiers, event = extended.groups()
+                code, modifiers = int(code), int(modifiers or 1)
+                if event == "3":  # key release
+                    return "unknown", j + 1
+                if code == 13:
+                    return ("newline" if modifiers == 2 else "\r"), j + 1
+                if modifiers == 5 and 64 <= code <= 127:
+                    return chr(code & 31), j + 1
+                if modifiers in (1, 2) and code in (9, 27, 127):
+                    return {9: "\t", 27: "esc", 127: "\x7f"}[code], j + 1
+                return "unknown", j + 1
             if seq.startswith("<"):  # SGR mouse report: 64/65 are wheel up/down, the rest is ignored
                 button = seq[1:].split(";")[0]
                 return {"64": "wheelup", "65": "wheeldown"}.get(button, "unknown"), j + 1
             return names.get(seq, "unknown"), j + 1
-        alt = {"b": "wordleft", "f": "wordright", "\x7f": "wordback"}
+        alt = {"\r": "newline", "\n": "newline", "b": "wordleft", "f": "wordright", "\x7f": "wordback"}
         return alt.get(nxt, "unknown"), i + 2
 
     def _handle_key(self, key, items):
@@ -1688,10 +1722,10 @@ class Screen:
                 self.buf, self.pos = list(text), len(text)
                 self.menu_closed = True
             return None
-        elif key == "\x0f":  # Ctrl-O inserts without sending
+        elif key in ("newline", "\n", "\x0f"):  # Shift-Enter; legacy LF and Ctrl-O aliases
             buf.insert(pos, "\n")
             self.pos += 1
-        elif key in ("\r", "\n"):
+        elif key == "\r":
             if items:
                 return items[self.sel][0]
             if pos and buf[pos - 1] == "\\":  # backslash + Enter: new line
@@ -1706,12 +1740,15 @@ class Screen:
         elif key in ("up", "down") and items:
             self.sel = (self.sel + (1 if key == "down" else -1)) % len(items)
             return None
-        elif key in ("up", "down") and "\n" in before:
-            lines = before.split("\n")
-            current = before[:pos].count("\n")
-            column = len(before[:pos].rsplit("\n", 1)[-1])
-            target = max(0, min(len(lines) - 1, current + (1 if key == "down" else -1)))
-            self.pos = sum(len(line) + 1 for line in lines[:target]) + min(column, len(lines[target]))
+        elif key in ("up", "down") and len(self.composer_rows()[0]) > 1:
+            rows, current = self.composer_rows()
+            column = visible_len(before[rows[current][0]:pos])
+            target = max(0, min(len(rows) - 1, current + (1 if key == "down" else -1)))
+            start, end = rows[target]
+            self.pos, cells = start, 0
+            while self.pos < end and cells + char_width(buf[self.pos]) <= column:
+                cells += char_width(buf[self.pos])
+                self.pos += 1
         elif key == "esc":
             self.menu_closed = True
             return None
