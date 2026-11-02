@@ -2,6 +2,10 @@
 
 Each version is a git tag. `localcode --version`, the header and `/status` show the version you're running.
 
+## v0.6.5 — 2026-11-02
+
+- The welcome screen no longer shows suggested prompts.
+
 ## v0.6.4 — 2026-11-02
 
 - Plan mode (`/plan`): the model can read, search, fetch and run read-only commands, and replies with its plan. Anything that changes files or state is refused until you turn plan mode off.

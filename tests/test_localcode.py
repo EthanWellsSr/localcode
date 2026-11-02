@@ -178,6 +178,7 @@ class TerminalTextTests(unittest.TestCase):
         self.assertIn("v" + lc.VERSION, lc.header_lines(agent, 80, 30)[0])
         self.assertIn("v" + lc.VERSION, lc.header_lines(agent, 80, 10)[0])
         self.assertIn("localcode v" + lc.VERSION, lc.welcome_lines(agent)[0])
+        self.assertFalse(any("❯" in line for line in lc.welcome_lines(agent)))  # no suggested prompts
         pyproject = (Path(lc.__file__).parent / "pyproject.toml").read_text()
         self.assertIn(f'version = "{lc.VERSION}"', pyproject)
         result = subprocess.run([sys.executable, lc.__file__, "--version"], text=True, capture_output=True, timeout=10)

@@ -52,7 +52,7 @@ Plan mode (`/plan`) is for when you want to hear the model's plan before anythin
 
 localcode runs full-window on the terminal's alternate screen, like `vim` or `htop`: your earlier terminal output is out of view while it runs and comes back unchanged when you quit. A compact header shows the workspace, leaving room for the conversation. The input stays pinned at the bottom, above the model, approval mode, context usage, and last reply's speed. A context meter appears in wider windows; narrow windows use a percentage.
 
-The welcome screen offers starter tasks and tells you whether project instructions were loaded. Try `/status` for the full session details, including your Ollama address. It doesn't call the model or consume context.
+The welcome screen shows the version and tells you whether project instructions were loaded. Try `/status` for the full session details, including your Ollama address. It doesn't call the model or consume context.
 
 Scroll back through the conversation with the mouse wheel, PgUp/PgDn or Shift+↑/↓, including while the model is thinking or streaming and while an approval prompt waits, so you can read a long diff before answering. Output is kept while you scroll; scroll down or press PgDn to return to the newest output. Other keys typed while the model is working are ignored, so wait for the prompt before typing your next message. Because the mouse wheel is handled by localcode, selecting text with the mouse needs your terminal's override key held while dragging (Fn in Terminal.app, Option in iTerm2). Use `--plain` if you prefer native terminal scrolling, selection, or a simpler display. `NO_COLOR=1` also uses inline prompts without color. Piped output stays plain Markdown.
 
@@ -61,14 +61,11 @@ Reasoning models' thinking is collapsed to a single "✻ Thought for Ns" line (s
 An example of the layout (colors omitted):
 
 ```text
-  ◆ localcode  /  Ollama
+  ◆ localcode v0.6.5  /  Ollama
   ~/code/myproject
 
-Your project. Your models.
+Your project. Your models.  localcode v0.6.5
 Start with a task, or explore before making changes.
-
-  ❯ Explain how this project works
-  ❯ Find the cause of a bug and propose a fix
 
 /model choose a model   /help keys and commands
 ────────────────────────────────────────────────────────────────────────────────

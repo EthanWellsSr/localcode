@@ -36,7 +36,7 @@ OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/"
 if not OLLAMA_HOST.startswith("http"):
     OLLAMA_HOST = "http://" + OLLAMA_HOST
 DEFAULT_MODEL = "gpt-oss:20b"
-VERSION = "0.6.4"
+VERSION = "0.6.5"
 NUM_CTX = int(os.environ.get("LOCALCODE_NUM_CTX", "32768"))
 MAX_STEPS = 40
 SHOW_THINKING = os.environ.get("LOCALCODE_SHOW_THINKING") == "1"  # else collapsed to "Thought for Ns"
@@ -1496,8 +1496,6 @@ def header_lines(agent, width, height):
 def welcome_lines(agent):
     return [bold("Your project. Your models.") + dim(f"  localcode v{VERSION}"),
             dim("Start with a task, or explore before making changes."), "",
-            cyan("  ❯ ") + "Explain how this project works",
-            cyan("  ❯ ") + "Find the cause of a bug and propose a fix", "",
             dim("/model") + " choose a model   " + dim("/help") + " keys and commands",
             instructions_status(agent.instructions)]
 
