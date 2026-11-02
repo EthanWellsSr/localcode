@@ -2027,7 +2027,7 @@ class Screen:
             return "  " + yellow("⏵⏵ auto-approve on") + dim(" (/yolo to turn off)")
         if self.agent.tools.auto:
             return "  " + cyan("⏵ auto mode: safe actions approved") + dim(" (/auto to turn off)")
-        return dim("  / commands · Ctrl-R history · Shift-Enter newline · PgUp scroll")
+        return dim("  / commands · Ctrl-R history · Shift-Enter newline")
 
     def fit(self, line):
         """Cut a line to the window width; a line that wraps would spill into the rows below it."""
