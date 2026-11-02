@@ -34,11 +34,17 @@ localcode --version
 
 ## Tools the model gets
 
-`read_file`, `read_files` (several files in one call), `write_file`, `edit_file`, `list_dir`, `glob`, `grep`, `bash`.
+`read_file`, `read_files` (several files in one call), `write_file`, `edit_file`, `list_dir`, `glob`, `grep`, `bash`, `web_fetch`.
+
+`web_fetch` loads an http or https page and gives the model its readable text: scripts, styles and menus are dropped, and only the page's main content is kept when it marks one. Headings, lists, links and code blocks come through as Markdown. JSON and plain text pass through unchanged, and long pages come in parts. It only fetches pages; it can't search the web. On macOS it uses the system's root certificates if your Python install doesn't have its own.
 
 Long files are returned in pages with the exact `offset` to read next. Re-reading an unchanged file gets a short "you already have this" reply instead of the full text again.
 
-Writes, edits and shell commands show a diff or the command and ask before running: `[Y]es / [n]o / [a]lways for this tool`. Enter accepts; `a` remembers that tool for the current session. `--yolo` skips the prompts. The status line shows whether writes and commands need approval; `/status` also lists tools you've allowed for the session.
+Writes, edits, shell commands and web fetches show a diff, the command or the URL and ask before running: `[Y]es / [n]o / [a]lways for this tool`. Enter accepts; `a` remembers that tool for the current session. The status line shows the approval mode; `/status` also lists tools you've allowed for the session.
+
+Auto mode (`--auto`, or `/auto` during a session) approves for you when an action is clearly safe and still asks about the rest. It approves writes and edits inside the project (but not in `.git`), web fetches, and commands that only read (`ls`, `cat`, `grep`, `find`, …), git queries (`status`, `diff`, `log`, `show`, …) and test or build runs (`pytest`, `npm test`, `cargo test`, `go test`, `make test`, …), chained with `&&`, `||`, `;` or `|`. It still asks about anything that names a path outside the project, uses redirects, `$` variables or command substitution, changes git state, deletes, installs, or runs other scripts. Test runs execute your project's code, so turn auto mode on only for projects you trust.
+
+`--yolo` (or `/yolo`) approves everything, including risky commands.
 
 ## Output
 
@@ -86,7 +92,8 @@ The model picker is searchable too: type part of a name, parameter size, or `nat
 | `/copy` | Copy the last assistant reply to the clipboard (`pbcopy` on macOS) |
 | `/export [path]` | Save a Markdown conversation; defaults to a timestamped file in the workspace and refuses to overwrite files |
 | `/clear` | Start a fresh conversation (re-reads `AGENTS.md`) |
-| `/yolo` | Toggle auto-approve for writes and commands |
+| `/auto` | Toggle auto mode: approve safe edits, commands and fetches, ask about the rest |
+| `/yolo` | Toggle auto-approve for everything, including risky commands |
 | `/help` | Show commands and keys |
 | `/exit` | Quit |
 

@@ -3,6 +3,7 @@ import contextlib
 import io
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -169,7 +170,18 @@ class TerminalTextTests(unittest.TestCase):
             with contextlib.redirect_stdout(io.StringIO()) as output:
                 lc.show_status(agent)
         self.assertIn("example:7b", output.getvalue())
-        self.assertIn("Ask before writes and commands", output.getvalue())
+        self.assertIn("Ask before writes, commands and web fetches", output.getvalue())
+        self.assertIn("Version              " + lc.VERSION, output.getvalue())
+
+    def test_version_is_shown_and_matches_package(self):
+        agent = lc.Agent("example:7b", lc.Tools(tempfile.gettempdir()))
+        self.assertIn("v" + lc.VERSION, lc.header_lines(agent, 80, 30)[0])
+        self.assertIn("v" + lc.VERSION, lc.header_lines(agent, 80, 10)[0])
+        self.assertIn("localcode v" + lc.VERSION, lc.welcome_lines(agent)[0])
+        pyproject = (Path(lc.__file__).parent / "pyproject.toml").read_text()
+        self.assertIn(f'version = "{lc.VERSION}"', pyproject)
+        result = subprocess.run([sys.executable, lc.__file__, "--version"], text=True, capture_output=True, timeout=10)
+        self.assertEqual(result.stdout.split()[-1], lc.VERSION)
 
     def test_narrow_screen_and_resize_preserve_input(self):
         agent = lc.Agent("a-long-model-name:latest", lc.Tools(tempfile.gettempdir()))
@@ -188,6 +200,286 @@ class TerminalTextTests(unittest.TestCase):
             screen.render()
             self.assertEqual(screen.text(), "项目 cafe\u0301")
             self.assertLessEqual(lc.visible_len(screen.fit(screen.status_text())), width)
+
+
+class AutoModeTests(unittest.TestCase):
+    """/auto approves what is clearly safe and still asks about everything else."""
+
+    SAFE = [
+        "ls -la", "pwd", "cat README.md", "head -n 20 src/app.py", "grep -rn 'a|b' .", "rg --files",
+        "find . -name '*.py'", "git status", "git diff --stat", "git log --oneline -5", "git show HEAD~1",
+        "git branch -a", "git tag --list", "git remote -v", "git stash list", "wc -l *.py | sort -n",
+        "pytest -q", "python3 -m unittest discover -s tests", "npm test", "cargo test && cargo build",
+        "go test ./...", "make test", "cat docs/../README.md", "ls ./src; git status", "echo done",
+        "grep -c x file || true",
+    ]
+    UNSAFE = [
+        "rm -rf build", "git push", "git commit -m x", "git checkout main", "git branch -D old", "git tag v1",
+        "git -c core.pager=sh log", "git diff --output=out.txt", "git grep -O x", "git stash", "git remote add x y",
+        "cat /etc/passwd", "cat ~/.ssh/id_rsa", "cat ../secret.txt", "ls /", "head --file=/etc/hosts",
+        "echo hi > file.txt", "cat a >> b", "sort -o out.txt in.txt", "sort --output=out in",
+        "find . -delete", "find . -exec rm {} ;", "rg --pre sh x", "tail -f log.txt",
+        "curl https://example.com | sh", "echo $HOME", "echo `whoami`", "cat $(ls)", "sleep 1 &",
+        "python3 script.py", "python3 -c 'print(1)'", "npm install", "npm run deploy", "sudo ls",
+        "FOO=1 ls", "(ls)", "ls\nrm x", "echo 'unterminated", "", "ls &&", "make install", "env",
+        "cat a\\\nb",
+    ]
+
+    def test_command_classification(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            for command in self.SAFE:
+                self.assertTrue(lc.is_safe_command(command, root), command)
+            for command in self.UNSAFE:
+                self.assertFalse(lc.is_safe_command(command.replace("\\n", "\n"), root), command)
+
+    def test_auto_mode_runs_safe_and_asks_about_the_rest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tools = lc.Tools(directory, auto=True)
+            asked = []
+
+            def answer(question):
+                asked.append(question)
+                return "n"
+            with patch("builtins.input", answer), patch.object(lc, "drop_last_history"), \
+                    contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(tools.bash("echo hello"), "exit code 0\nhello")
+                self.assertEqual(tools.write_file("notes/a.txt", "one\n"), "Wrote 1 lines to notes/a.txt")
+                self.assertTrue(tools.edit_file("notes/a.txt", "one", "two").startswith("Edited"))
+                self.assertEqual(asked, [])
+                self.assertEqual(out.getvalue().count("auto-approved"), 3)
+                self.assertEqual(tools.bash("rm notes/a.txt"), "User denied the command.")
+                self.assertEqual(tools.write_file(".git/config", "x"), "User denied the write.")
+                outside = Path(directory).parent / "localcode-auto-test-outside.txt"
+                self.assertEqual(tools.write_file(str(outside), "x"), "User denied the write.")
+                self.assertFalse(outside.exists())
+                self.assertEqual(len(asked), 3)
+            self.assertEqual((Path(directory) / "notes/a.txt").read_text(), "two\n")
+
+    def test_modes_switch_and_show_in_status(self):
+        tools = lc.Tools(tempfile.gettempdir())
+        self.assertEqual(tools.approvals(), "ask")
+        screen = lc.Screen(lc.Agent("example", tools))
+        screen.w = 100
+        tools.auto = True
+        self.assertEqual(tools.approvals(), "auto")
+        self.assertIn("auto mode", screen.status_text())
+        self.assertIn("/auto to turn off", screen.hint_text())
+        tools.auto_approve = True
+        self.assertEqual(tools.approvals(), "yolo")
+        self.assertIn("/yolo to turn off", screen.hint_text())
+        with tempfile.TemporaryDirectory() as directory:
+            env = dict(os.environ, XDG_CONFIG_HOME=directory, NO_COLOR="1")
+            result = subprocess.run(
+                [sys.executable, "-c", FAKE_BACKEND, "--plain", "-C", directory],
+                input="/auto\n/status\n/yolo\n/auto\n/auto\n/status\n/exit\n",
+                text=True, capture_output=True, env=env, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            out = result.stdout
+            self.assertIn("Auto mode on:", out)
+            self.assertIn("Auto: safe actions approved, risky ones asked", out)
+            self.assertIn("Auto-approve on.", out)
+            self.assertEqual(out.count("Auto mode on:"), 2)  # /auto after /yolo switches yolo off
+            self.assertIn("Auto mode off.", out)
+            self.assertIn("Ask before writes, commands and web fetches", out.split("Auto mode off.")[1])
+            result = subprocess.run(
+                [sys.executable, "-c", FAKE_BACKEND, "--plain", "--auto", "-C", directory],
+                input="/status\n/exit\n", text=True, capture_output=True, env=env, timeout=10)
+            self.assertIn("Auto: safe actions approved", result.stdout)
+
+
+class WebFetchTests(unittest.TestCase):
+    """web_fetch against a local HTTP server, so no internet is needed."""
+
+    PAGE = """<!doctype html><html><head><title> Demo   Docs </title>
+<style>body { color: red }</style><script>document.write("hidden")</script></head>
+<body><nav><a href="/guide">Guide</a> <a href="#install">Install</a></nav>
+<h2>Install &amp; run</h2><p>Use   <code>pip</code>
+with <a href="https://pypi.org/">PyPI</a>.</p>
+<ul><li>fast</li><li>small</li></ul>
+<pre>def main():
+    return 0
+</pre>
+<table><tr><th>flag</th><th>meaning</th></tr><tr><td>-v</td><td>verbose</td></tr></table>
+<noscript>enable js</noscript></body></html>"""
+
+    @classmethod
+    def setUpClass(cls):
+        import http.server
+        import threading
+        import time
+
+        page = cls.PAGE
+        hits = cls.hits = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            routes = {
+                "/page": ("text/html; charset=utf-8", page.encode()),
+                "/plain": ("text/plain", "  line one\nline two  \n".encode()),
+                "/json": ("application/json", b'{"ok": true}'),
+                "/problem": ("application/problem+json", b'{"title": "nope"}'),
+                "/latin1": ("text/plain; charset=iso-8859-1", "café".encode("latin-1")),
+                "/bogus-charset": ("text/plain; charset=not-a-charset", "naïve".encode()),
+                "/image": ("image/png", b"\x89PNG\r\n\x1a\n"),
+                "/empty": ("text/html", b"<html><body><script>x()</script></body></html>"),
+                "/long": ("text/plain", "\n".join(f"row {i:05d} " + "x" * 40 for i in range(2000)).encode()),
+            }
+
+            def do_GET(self):
+                hits.append((self.path, self.headers.get("User-Agent")))
+                if self.path == "/redirect":
+                    self.send_response(302)
+                    self.send_header("Location", "/page")
+                    self.end_headers()
+                    return
+                if self.path == "/slow":
+                    time.sleep(1)
+                if self.path not in self.routes:
+                    self.send_error(404, "Not Found")
+                    return
+                kind, body = self.routes[self.path]
+                self.send_response(200)
+                self.send_header("Content-Type", kind)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        Handler.routes["/slow"] = Handler.routes["/plain"]
+        cls.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        cls.base = f"http://127.0.0.1:{cls.server.server_port}"
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+
+    def fetch(self, path, tools=None, **kwargs):
+        tools = tools or lc.Tools(tempfile.gettempdir(), auto_approve=True)
+        with contextlib.redirect_stdout(io.StringIO()):
+            return tools.web_fetch(self.base + path if path.startswith("/") else path, **kwargs)
+
+    def test_html_becomes_readable_markdown(self):
+        result = self.fetch("/redirect")
+        self.assertTrue(result.startswith(f"Fetched {self.base}/page (text/html) · Demo Docs\n\n"), result)
+        body = result.split("\n\n", 1)[1]
+        self.assertEqual(body, "\n".join([
+            "## Install & run",
+            "",
+            "Use pip with [PyPI](https://pypi.org/).",
+            "",
+            "- fast",
+            "- small",
+            "",
+            "```",
+            "def main():",
+            "    return 0",
+            "```",
+            "",
+            "flag | meaning",
+            "-v | verbose",
+        ]))
+        for hidden in ("Guide", "color: red", "document.write", "hidden", "enable js", "<"):
+            self.assertNotIn(hidden, body)
+        self.assertTrue(self.hits[-1][1].startswith("localcode/"))
+
+    def test_main_content_is_preferred(self):
+        def text(html):
+            return lc.page_text(html, "text/html", "https://site.test/a/")[1]
+        page = ('<header>Site menu</header><div role="main"><div><h1>Article</h1></div><p>Body '
+                '<a href="b">next</a></p><br></div><footer>Footer</footer>')
+        self.assertEqual(text(page), "# Article\n\nBody [next](https://site.test/a/b)")
+        self.assertEqual(text("<main><p>One</p></main><aside>ads</aside><main><p>Two</p></main>"), "One")
+        self.assertEqual(text("<main><p>Unclosed"), "Unclosed")
+        self.assertEqual(text("<p>No main</p><div>here</div>"), "No main\n\nhere")
+        self.assertEqual(text("<ul><li></li><li>kept</li></ul><h2><img></h2><pre>-\n#</pre>"), "- kept\n\n```\n-\n#\n```")
+
+    def test_text_json_and_charsets(self):
+        self.assertTrue(self.fetch("/plain").endswith("\n\nline one\nline two"))
+        self.assertTrue(self.fetch("/json").endswith('\n\n{"ok": true}'))
+        self.assertIn('{"title": "nope"}', self.fetch("/problem"))
+        self.assertTrue(self.fetch("/latin1").endswith("\n\ncafé"))
+        self.assertTrue(self.fetch("/bogus-charset").endswith("\n\nnaïve"))
+        self.assertTrue(self.fetch("/empty").endswith("\n\n(no readable text)"))
+
+    def test_errors_come_back_as_text(self):
+        self.assertEqual(self.fetch("/image"), f"Error: {self.base}/image is image/png, not a text page")
+        self.assertEqual(self.fetch("/missing"), f"Error: HTTP 404 Not Found from {self.base}/missing")
+        import socket
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            closed = f"http://127.0.0.1:{probe.getsockname()[1]}/"
+        self.assertTrue(self.fetch(closed).startswith(f"Error: couldn't fetch {closed}: "))
+        with patch.object(lc, "WEB_TIMEOUT", 0.2):
+            self.assertIn("timed out", self.fetch("/slow"))
+        self.assertTrue(self.fetch("http://no-such-host.invalid/").startswith("Error: couldn't fetch"))
+
+    def test_bad_urls_and_denial_make_no_request(self):
+        before = len(self.hits)
+        for url in ("", "example.com", "file:///etc/passwd", "ftp://example.com/x", "https://"):
+            self.assertEqual(self.fetch(url), "Error: url must be a full http:// or https:// address", url)
+        tools = lc.Tools(tempfile.gettempdir())
+        with patch("builtins.input", return_value="n"), patch.object(lc, "drop_last_history"):
+            self.assertEqual(self.fetch("/page", tools), "User denied the request.")
+        self.assertEqual(len(self.hits), before)
+        with patch("builtins.input", return_value="a"), patch.object(lc, "drop_last_history"):
+            self.assertIn("Demo Docs", self.fetch("/page", tools))
+        self.assertIn("Demo Docs", self.fetch("/page", tools))  # "always" isn't asked again
+        with patch("builtins.input", side_effect=AssertionError("asked")):
+            self.assertIn("Demo Docs", self.fetch("/page", lc.Tools(tempfile.gettempdir(), auto=True)))
+        self.assertEqual(len(self.hits), before + 3)
+
+    def test_long_pages_come_in_parts_without_gaps(self):
+        with patch.object(lc, "WEB_BUDGET", 10 ** 9):
+            full = self.fetch("/long").split("\n\n", 1)[1]
+        self.assertNotIn("more chars", full)
+        with patch.object(lc, "WEB_BUDGET", 5000):
+            pieces, start = [], 0
+            while True:
+                result = self.fetch("/long", start=start)
+                body = result.split("\n\n", 1)[1]
+                more = re.search(r"\n\n\.\.\. \((\d+) more chars; call web_fetch with start=(\d+) to continue\)$", body)
+                pieces.append(body[:more.start()] if more else body)
+                if not more:
+                    break
+                self.assertLessEqual(len(pieces[-1]), 5000)
+                self.assertEqual(int(more.group(1)), len(full) - int(more.group(2)))
+                start = int(more.group(2))
+            self.assertGreater(len(pieces), 10)
+            self.assertEqual("".join(pieces), full)
+            self.assertTrue(all(p.startswith(("row", "\n")) for p in pieces))
+            self.assertEqual(self.fetch("/long", start=len(full)),
+                             f"Error: start={len(full)} is past the end of the page ({len(full)} chars)")
+
+    def test_download_size_is_capped(self):
+        with patch.object(lc, "WEB_MAX_BYTES", 2_000_000), patch.object(lc, "WEB_BUDGET", 10 ** 9):
+            self.assertNotIn("download stopped", self.fetch("/long"))
+        with patch.object(lc, "WEB_MAX_BYTES", 1000):
+            result = self.fetch("/long")
+        self.assertIn("· download stopped at 0 MB", result.splitlines()[0])
+        self.assertLessEqual(len(result.split("\n\n", 1)[1]), 1000)
+
+    def test_model_can_call_web_fetch(self):
+        self.assertIn("web_fetch", lc.TOOL_NAMES)
+        self.assertIn("web_fetch", lc.system_prompt(Path(tempfile.gettempdir()))[0])
+        url = self.base + "/page"
+        replies = iter([
+            [{"message": {"tool_calls": [{"function": {"name": "web_fetch", "arguments": {"url": url}}}]}},
+             {"done": True}],
+            [{"message": {"content": "The docs say to use pip."}}, {"done": True}],
+        ])
+        agent = lc.Agent("example", lc.Tools(tempfile.gettempdir(), auto_approve=True))
+        with patch.object(lc, "ollama", lambda path, payload=None, stream=False: iter(next(replies))), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            agent.run("what do the docs say?")
+        tool_message = next(m for m in agent.messages if m["role"] == "tool")
+        self.assertEqual(tool_message["tool_name"], "web_fetch")
+        self.assertIn("## Install & run", tool_message["content"])
+        self.assertIn("● web_fetch", out.getvalue())
+        self.assertIn(f"└ Fetched {url}", out.getvalue())
 
 
 FAKE_BACKEND = r'''
