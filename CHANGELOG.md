@@ -2,6 +2,10 @@
 
 Each version is a git tag. `localcode --version`, the header and `/status` show the version you're running.
 
+## v0.6.1 — 2026-11-02
+
+- Approval prompts keep the mouse wheel and PgUp/PgDn inside localcode, so you can scroll back through a long diff before answering. Previously the terminal scrolled its own history instead and the prompt went out of view.
+
 ## v0.6.0 — 2026-11-02
 
 - `web_fetch` tool: the model can read web pages (docs, API references, JSON endpoints) as readable text, in parts for long pages.

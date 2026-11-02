@@ -12,7 +12,7 @@ back to parsing JSON tool calls out of plain text for models that do that.
 
 import argparse
 import atexit
-from contextlib import contextmanager, nullcontext
+from contextlib import nullcontext
 import difflib
 import fnmatch
 from html.parser import HTMLParser
@@ -36,7 +36,7 @@ OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/"
 if not OLLAMA_HOST.startswith("http"):
     OLLAMA_HOST = "http://" + OLLAMA_HOST
 DEFAULT_MODEL = "gpt-oss:20b"
-VERSION = "0.6.0"
+VERSION = "0.6.1"
 NUM_CTX = int(os.environ.get("LOCALCODE_NUM_CTX", "32768"))
 MAX_STEPS = 40
 SHOW_THINKING = os.environ.get("LOCALCODE_SHOW_THINKING") == "1"  # else collapsed to "Thought for Ns"
@@ -1530,11 +1530,12 @@ class Transcript:
             del self.lines[:len(self.lines) - self.MAX_LINES]
 
     def ask(self, question):
-        with self.screen.pause_busy_input() if self.screen else nullcontext():
-            return self._ask(question)
+        if self.screen and self.screen.busy:
+            return self.screen.ask_busy(question)
+        return self._ask(question)
 
     def _ask(self, question):
-        """A y/n style prompt with mouse reporting off and canonical input restored."""
+        """A y/n style prompt outside a run: mouse reporting off so wheel scrolls don't type garbage."""
         self.raw.write("\033[?1000l")
         self.write(question)
         self.flush()
@@ -1543,8 +1544,7 @@ class Transcript:
             if not answer:
                 raise EOFError
         finally:
-            if not (self.screen and self.screen.busy):
-                self.raw.write("\033[?1000h")
+            self.raw.write("\033[?1000h")
         answer = answer.rstrip("\n")
         self.cur += answer  # the terminal echoed it; keep the copy in step
         self._newline()
@@ -1743,13 +1743,38 @@ class Screen:
             if self.busy:
                 self.draw_frame()
 
-    @contextmanager
-    def pause_busy_input(self):
-        """Give tool approval prompts sole ownership of canonical terminal input."""
-        if not self.busy:
-            yield
-            return
-        import termios
+    def read_busy_keys(self, timeout):
+        """Keys typed during a run, from raw input; an unfinished escape sequence waits for the rest."""
+        import select
+        if not select.select([self.busy_fd], [], [], timeout)[0]:
+            return []
+        chunk = os.read(self.busy_fd, 4096)
+        if not chunk:
+            raise EOFError
+        self.busy_pending += chunk.decode("utf-8", errors="replace")
+        keys = []
+        while self.busy_pending:
+            pending = self.busy_pending
+            if pending == "\x1b" or (pending.startswith("\x1b[") and not re.search(r"[@-~]", pending[2:])):
+                break
+            key, end = self._next_key(pending, 0)
+            self.busy_pending = pending[end:]
+            keys.append(key)
+        return keys
+
+    def scroll_key(self, key):
+        """Scroll for a wheel or PgUp/PgDn key; returns whether it was one."""
+        if key not in self.SCROLL_KEYS:
+            return False
+        amount = self.SCROLL_KEYS[key]
+        if key.startswith("page"):
+            amount *= max(1, self.bottom - self.top - 2)
+        self.scroll(amount)
+        return True
+
+    def ask_busy(self, question):
+        """An approval prompt during a run. The wheel and PgUp/PgDn still scroll the conversation (to read a
+        long diff first), and typing brings the view back to the prompt."""
         self.prompt_waiting.set()  # the scroll reader steps aside instead of re-taking the lock
         with self.input_lock:
             self.prompt_waiting.clear()
@@ -1757,21 +1782,45 @@ class Screen:
                 self.offset = 0
                 self.render_view()
                 self.draw_frame()
-            # Discard incomplete mouse reports before enabling echoed line input.
-            self._w("\033[?1000l")
-            termios.tcflush(self.busy_fd, termios.TCIFLUSH)
-            termios.tcsetattr(self.busy_fd, termios.TCSADRAIN, self.busy_saved)
-            try:
-                yield
-            finally:
-                termios.tcsetattr(self.busy_fd, termios.TCSADRAIN, self.busy_raw)
-                self._w("\033[?1000h")
+
+            def echo(text):
+                self.rec.write(text)
+                self.rec.flush()
+
+            echo(question)
+            answer = ""
+            while True:
+                for key in self.read_busy_keys(0.1):
+                    if self.scroll_key(key):
+                        continue
+                    typed = isinstance(key, str) and len(key) == 1 and " " <= key <= "~"
+                    if not (typed or key in ("\r", "\n", "\x7f", "\x08", "\x04")):
+                        continue
+                    with self.lock:
+                        if self.offset:
+                            self.offset = 0
+                            self.render_view()
+                            self.draw_frame()
+                        if key in ("\r", "\n"):
+                            echo("\n")
+                            return answer
+                        if key == "\x04":
+                            if answer:
+                                continue
+                            echo("\n")
+                            raise EOFError
+                        if typed:
+                            answer += key
+                            echo(key)
+                        elif answer:
+                            answer = answer[:-1]
+                            self.rec.cur = self.rec.cur[:-1]
+                            self._w("\b \b")
 
     def run_agent(self, text):
         """Keep wheel/page input out of terminal echo while the model and tools run."""
         if not self.active:
             return self.agent.run(text)
-        import select
         import termios
 
         self.busy_fd = sys.stdin.fileno()
@@ -1784,7 +1833,6 @@ class Screen:
         done = threading.Event()
 
         def read_scroll():
-            pending = ""
             while not done.is_set():
                 if self.prompt_waiting.is_set():
                     done.wait(0.01)
@@ -1792,26 +1840,16 @@ class Screen:
                 with self.input_lock:
                     if done.is_set():
                         break
-                    if not select.select([self.busy_fd], [], [], 0.05)[0]:
-                        continue
-                    chunk = os.read(self.busy_fd, 4096)
-                    if not chunk:
+                    try:
+                        keys = self.read_busy_keys(0.05)
+                    except EOFError:
                         break
-                    pending += chunk.decode("utf-8", errors="replace")
-                    while pending:
-                        if pending == "\x1b" or (pending.startswith("\x1b[") and
-                                                not re.search(r"[@-~]", pending[2:])):
-                            break
-                        key, end = self._next_key(pending, 0)
-                        pending = pending[end:]
-                        if key in self.SCROLL_KEYS:
-                            amount = self.SCROLL_KEYS[key]
-                            if key.startswith("page"):
-                                amount *= max(1, self.bottom - self.top - 2)
-                            self.scroll(amount)
+                    for key in keys:
+                        self.scroll_key(key)
 
         thread = threading.Thread(target=read_scroll, daemon=True)
         self.prompt_waiting.clear()  # an interrupted prompt may have left it set
+        self.busy_pending = ""
         self.busy = True
         termios.tcsetattr(self.busy_fd, termios.TCSADRAIN, self.busy_raw)
         try:

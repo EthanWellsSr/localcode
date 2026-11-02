@@ -566,7 +566,8 @@ lc.main()
         backend = FAKE_BACKEND.replace('lc.main()', """
 import time
 def run(self, text):
-    if text == "approve":
+    if text in ("approve", "deny", "eof"):
+        print("\\n".join("diff line " + str(i) for i in range(60)), flush=True)
         accepted = self.tools.confirm("test", "permission test")
         print("approval accepted" if accepted else "approval rejected", flush=True)
     elif text == "fail":
@@ -577,7 +578,8 @@ def run(self, text):
 lc.Agent.run = run
 lc.main()
 """)
-        for scenario, expected in (("approve", "approval accepted"), ("fail", "Model error:"),
+        for scenario, expected in (("approve", "approval accepted"), ("deny", "approval rejected"),
+                                   ("eof", "approval rejected"), ("fail", "Model error:"),
                                    ("interrupt", "Interrupted.")):
             with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as directory:
                 master, slave = pty.openpty()
@@ -607,8 +609,21 @@ lc.main()
                     os.write(master, scenario.encode() + b"\r")
                     if scenario == "approve":
                         wait_for("[Y]es / [n]o / [a]lways for this tool:")
-                        self.assertTrue(termios.tcgetattr(slave)[3] & termios.ICANON)
-                        os.write(master, b"y\r")
+                        self.assertFalse(termios.tcgetattr(slave)[3] & termios.ECHO)
+                        # The wheel and PgUp scroll back through the diff while the prompt waits.
+                        for chunk in (b"\x1b[<64;", b"10;10M", b"\x1b[5~"):
+                            os.write(master, chunk)
+                            time.sleep(0.02)
+                        wait_for("scrolled back")
+                        os.write(master, b"x\x7fy")  # typing returns to the prompt; backspace edits
+                        wait_for("\b \b")
+                        os.write(master, b"\r")
+                    elif scenario == "deny":
+                        wait_for("[Y]es / [n]o / [a]lways for this tool:")
+                        os.write(master, b"no\r")
+                    elif scenario == "eof":
+                        wait_for("[Y]es / [n]o / [a]lways for this tool:")
+                        os.write(master, b"\x04")
                     elif scenario == "interrupt":
                         wait_for("interrupt ready")
                         self.assertFalse(termios.tcgetattr(slave)[3] & termios.ECHO)
@@ -625,6 +640,9 @@ lc.main()
                     self.assertEqual(restored, original)
                     self.assertEqual(process.returncode, 0)
                     self.assertNotIn(b"Traceback", output)
+                    # Mouse reporting stays on until exit, so the terminal never scrolls its own history.
+                    self.assertEqual(output.count(b"\x1b[?1000l"), 1)
+                    self.assertNotIn(b"^[[<", output)
                 finally:
                     if process.poll() is None:
                         process.kill()
