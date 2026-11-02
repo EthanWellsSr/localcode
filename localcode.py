@@ -36,7 +36,7 @@ OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/"
 if not OLLAMA_HOST.startswith("http"):
     OLLAMA_HOST = "http://" + OLLAMA_HOST
 DEFAULT_MODEL = "gpt-oss:20b"
-VERSION = "0.6.2"
+VERSION = "0.6.3"
 NUM_CTX = int(os.environ.get("LOCALCODE_NUM_CTX", "32768"))
 MAX_STEPS = 40
 SHOW_THINKING = os.environ.get("LOCALCODE_SHOW_THINKING") == "1"  # else collapsed to "Thought for Ns"
@@ -574,10 +574,38 @@ TEST_COMMANDS = [c.split() for c in (
     "make test")]
 
 
-def is_safe_command(command, root):
+def asked_to_push(request):
+    """Whether the user's own latest message asks to push (and doesn't say not to)."""
+    text = (request or "").lower()
+    return bool(re.search(r"\bpush", text)) and not re.search(r"\b(don'?t|do not|never|not|no|without)\b[^.!?]*\bpush", text)
+
+
+def _safe_git_commit(args):
+    """git commit with a message (without one it opens an editor) and maybe -a: no amending, no skipping hooks."""
+    i, message = 0, False
+    while i < len(args):
+        a = args[i]
+        if a in ("-m", "--message", "-am"):
+            message, i = i + 1 < len(args), i + 2
+            continue
+        message = message or a.startswith("--message=")
+        if not (a.startswith("--message=") or a in ("-a", "--all") or not a.startswith("-")):
+            return False
+        i += 1
+    return message
+
+
+def _safe_git_push(args):
+    """A plain push of a branch: git push [-u] [origin [branch]], never forced, deleting or pushing tags."""
+    args = [a for a in args if a not in ("-u", "--set-upstream")]
+    return (len(args) <= 2 and all(not a.startswith(("-", "+")) and ":" not in a for a in args))
+
+
+def is_safe_command(command, root, request=""):
     """Whether /auto may run a shell command without asking.
 
-    Allows read-only commands, git queries and test runs, chained with &&, ||, ; or |, as long as every
+    Allows read-only commands, git queries, git add and commit, test runs, and a plain git push when the
+    user's latest message (request) asked to push. They can be chained with &&, ||, ; or |, as long as every
     path they name is inside the project. Redirects, substitutions, variables and anything else get asked about.
     """
     if re.search(r"[$`\n\\]", command):
@@ -598,10 +626,10 @@ def is_safe_command(command, root):
         else:
             current.append(token)
     commands.append(current)
-    return all(cmd and _safe_simple_command(cmd, root) for cmd in commands)
+    return all(cmd and _safe_simple_command(cmd, root, request) for cmd in commands)
 
 
-def _safe_simple_command(cmd, root):
+def _safe_simple_command(cmd, root, request=""):
     for arg in cmd[1:]:
         value = arg.split("=", 1)[1] if arg.startswith("-") and "=" in arg else arg
         if value.startswith(("/", "~")) or ".." in Path(value).parts:
@@ -620,6 +648,12 @@ def _safe_simple_command(cmd, root):
             return True
         if sub in GIT_LISTING:
             return all(a in GIT_LISTING[sub] for a in rest)
+        if sub == "add":
+            return all(a in ("-A", "--all", "-u", "--update", "-v") or not a.startswith("-") for a in rest)
+        if sub == "commit":
+            return _safe_git_commit(rest)
+        if sub == "push":
+            return asked_to_push(request) and _safe_git_push(rest)
         return sub == "stash" and rest == ["list"]
     return any(cmd[:len(t)] == t for t in TEST_COMMANDS)
 
@@ -630,7 +664,8 @@ class Tools:
         self.auto_approve = auto_approve  # /yolo: approve everything
         self.auto = auto  # /auto: approve what looks safe, ask about the rest
         self.always = set()  # tool names approved for the rest of the session
-        self.seen = {}  # (path, offset) -> (mtime, last line) for the repeat-read guard
+        self.seen = {}  # (path, offset) -> (mtime, last line shown, last line asked for) for the repeat-read guard
+        self.request = ""  # the user's latest message; /auto pushes only when it asks to
 
     def resolve(self, path):
         p = Path(os.path.expanduser(path or "."))
@@ -800,7 +835,7 @@ class Tools:
 
     def bash(self, command, timeout=120):
         print(dim(f"  $ {command}"))
-        if not self.confirm("bash", "", safe=self.auto and is_safe_command(command, self.root)):
+        if not self.confirm("bash", "", safe=self.auto and is_safe_command(command, self.root, self.request)):
             return "User denied the command."
         try:
             r = subprocess.run(command, shell=True, cwd=self.root, capture_output=True,
@@ -1109,6 +1144,7 @@ class Agent:
 
     def run(self, user_input):
         self.messages.append({"role": "user", "content": user_input})
+        self.tools.request = user_input
         nudged = False
         for _ in range(MAX_STEPS):
             content, tool_calls, native = self.chat_once()
@@ -2421,8 +2457,9 @@ def main():
                         print(dim(f"Auto-approve {'on' if tools.auto_approve else 'off'}."))
                     elif cmd == "/auto":
                         tools.auto, tools.auto_approve = not tools.auto, False
-                        print(dim("Auto mode on: edits in this project, web fetches, read-only commands and test runs "
-                                  "are approved; anything else still asks." if tools.auto else "Auto mode off."))
+                        print(dim("Auto mode on: edits in this project, web fetches, read-only commands, test runs and "
+                                  "git add/commit are approved, plus git push when you ask for it; anything else still "
+                                  "asks." if tools.auto else "Auto mode off."))
                     else:
                         print(red("Unknown command.") + " " + HELP)
                     continue

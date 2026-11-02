@@ -293,10 +293,14 @@ class AutoModeTests(unittest.TestCase):
         "git branch -a", "git tag --list", "git remote -v", "git stash list", "wc -l *.py | sort -n",
         "pytest -q", "python3 -m unittest discover -s tests", "npm test", "cargo test && cargo build",
         "go test ./...", "make test", "cat docs/../README.md", "ls ./src; git status", "echo done",
-        "grep -c x file || true",
+        "grep -c x file || true", "git add .", "git add -A", "git add docs/*.md README.md",
+        "git commit -m 'Reorganize reports'", "git commit -am 'Fix typo'", "git commit --message=done",
+        "git add . && git commit -m 'Update README'",
     ]
     UNSAFE = [
-        "rm -rf build", "git push", "git commit -m x", "git checkout main", "git branch -D old", "git tag v1",
+        "rm -rf build", "git push", "git commit", "git commit -a", "git commit -m",
+        "git commit --amend -m x", "git commit --no-verify -m x", "git add -f secret.env", "git add ../x",
+        "git checkout main", "git branch -D old", "git tag v1",
         "git -c core.pager=sh log", "git diff --output=out.txt", "git grep -O x", "git stash", "git remote add x y",
         "cat /etc/passwd", "cat ~/.ssh/id_rsa", "cat ../secret.txt", "ls /", "head --file=/etc/hosts",
         "echo hi > file.txt", "cat a >> b", "sort -o out.txt in.txt", "sort --output=out in",
@@ -314,6 +318,39 @@ class AutoModeTests(unittest.TestCase):
                 self.assertTrue(lc.is_safe_command(command, root), command)
             for command in self.UNSAFE:
                 self.assertFalse(lc.is_safe_command(command.replace("\\n", "\n"), root), command)
+
+    def test_push_only_when_the_latest_message_asks(self):
+        root = Path(tempfile.gettempdir()).resolve()
+        for request in ("push it", "commit and push", "Push this to GitHub please", "ok, push."):
+            for command in ("git push", "git push origin main", "git push -u origin feature/x",
+                            "git add . && git commit -m 'Reorganize reports' && git push"):
+                self.assertTrue(lc.is_safe_command(command, root, request), (request, command))
+        for request in ("", "commit it", "don't push yet", "do not push", "commit but not push",
+                        "never push to main", "commit without pushing"):
+            self.assertFalse(lc.is_safe_command("git push", root, request), request)
+        for command in ("git push --force", "git push -f origin main", "git push origin +main",
+                        "git push origin :old", "git push --delete origin old", "git push --tags",
+                        "git push --mirror", "git push origin main extra", "git push --force-with-lease"):
+            self.assertFalse(lc.is_safe_command(command, root, "push it"), command)
+
+    def test_auto_mode_uses_the_users_message_not_the_models(self):
+        with tempfile.TemporaryDirectory() as directory:
+            subprocess.run(["git", "init", "-q", directory], check=True)
+            agent = lc.Agent("example", lc.Tools(directory, auto=True))
+            replies = iter([
+                [{"message": {"tool_calls": [{"function": {"name": "bash",
+                                                           "arguments": {"command": "git push"}}}]}}, {"done": True}],
+                [{"message": {"content": "Done."}}, {"done": True}],
+            ] * 2)
+            fake = lambda path, payload=None, stream=False: iter(next(replies))
+            asked = []
+            with patch.object(lc, "ollama", fake), patch("builtins.input", lambda q: asked.append(q) or "n"), \
+                    patch.object(lc, "drop_last_history"), contextlib.redirect_stdout(io.StringIO()) as out:
+                agent.run("push it")
+                self.assertEqual(asked, [])
+                self.assertIn("auto-approved", out.getvalue())
+                agent.run("thanks, that's all")  # the model pushing again unasked still needs approval
+                self.assertEqual(len(asked), 1)
 
     def test_auto_mode_runs_safe_and_asks_about_the_rest(self):
         with tempfile.TemporaryDirectory() as directory:

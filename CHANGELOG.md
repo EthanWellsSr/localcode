@@ -2,6 +2,10 @@
 
 Each version is a git tag. `localcode --version`, the header and `/status` show the version you're running.
 
+## v0.6.3 — 2026-11-02
+
+- Auto mode approves `git add` and `git commit -m …`, and a plain `git push` when your latest message asks to push. Force-pushes, deleting branches, pushing tags, amending and skipping hooks still ask.
+
 ## v0.6.2 — 2026-11-02
 
 - After a failed `edit_file`, reading that file again returns its text instead of "you already read this", so the model can copy the exact text and retry.
