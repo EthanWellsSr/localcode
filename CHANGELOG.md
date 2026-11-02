@@ -2,6 +2,11 @@
 
 Each version is a git tag. `localcode --version`, the header and `/status` show the version you're running.
 
+## v0.6.6 — 2026-11-02
+
+- Fix a crash when the window is resized while localcode is writing to a slow terminal: the redraw now waits until the write finishes instead of failing with "reentrant call". This was also why CI failed now and then.
+- The terminal tests keep reading localcode's output until it exits, and print every thread's stack if it hangs.
+
 ## v0.6.5 — 2026-11-02
 
 - The welcome screen no longer shows suggested prompts.

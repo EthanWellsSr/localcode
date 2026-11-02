@@ -36,7 +36,7 @@ OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/"
 if not OLLAMA_HOST.startswith("http"):
     OLLAMA_HOST = "http://" + OLLAMA_HOST
 DEFAULT_MODEL = "gpt-oss:20b"
-VERSION = "0.6.5"
+VERSION = "0.6.6"
 NUM_CTX = int(os.environ.get("LOCALCODE_NUM_CTX", "32768"))
 MAX_STEPS = 40
 SHOW_THINKING = os.environ.get("LOCALCODE_SHOW_THINKING") == "1"  # else collapsed to "Thought for Ns"
@@ -80,6 +80,38 @@ def prompt(text):
 def term_out():
     """The real terminal stream, bypassing the full-window conversation recorder when it's installed."""
     return getattr(sys.stdout, "raw", sys.stdout)
+
+
+class TerminalWriter:
+    """The terminal stream, tracking when the main thread is in the middle of a write.
+
+    A resize redraw runs in the SIGWINCH handler, which can interrupt a write that is waiting on a slow
+    terminal; writing again from there raises "reentrant call". The redraw waits until the write finishes.
+    """
+
+    def __init__(self, stream):
+        self.stream, self.depth, self.deferred = stream, 0, None
+
+    def write(self, s):
+        return self._call(self.stream.write, s)
+
+    def flush(self):
+        return self._call(self.stream.flush)
+
+    def _call(self, fn, *args):
+        if threading.current_thread() is not threading.main_thread():
+            return fn(*args)  # signal handlers only run on the main thread
+        self.depth += 1
+        try:
+            return fn(*args)
+        finally:
+            self.depth -= 1
+            if not self.depth and self.deferred:
+                run, self.deferred = self.deferred, None
+                run()
+
+    def __getattr__(self, name):
+        return getattr(self.stream, name)
 
 
 class Spinner:
@@ -1599,6 +1631,8 @@ class Transcript:
 
     def write(self, s):
         with self.screen.lock if self.screen else nullcontext():
+            if isinstance(self.raw, TerminalWriter):
+                return self.raw._call(self._write, s)  # a resize redraw waits until the copy is up to date
             return self._write(s)
 
     def _write(self, s):
@@ -1729,7 +1763,7 @@ class Screen:
             return
         self.active = True
         self.history = load_editor_history()
-        self.raw = sys.stdout
+        self.raw = TerminalWriter(sys.stdout)
         self.rec = sys.stdout = Transcript(self.raw, self)
         atexit.register(self.stop)
         try:
@@ -1788,6 +1822,9 @@ class Screen:
 
     def on_resize(self):
         if not self.active or self.choosing:
+            return
+        if getattr(self.raw, "depth", 0):
+            self.raw.deferred = self.on_resize  # interrupted a write; redraw once it's done
             return
         with self.lock:
             self.redraw_all()
@@ -2364,7 +2401,7 @@ class Screen:
         if not self.active:
             return
         self.active = False
-        sys.stdout = self.raw
+        sys.stdout = getattr(self.raw, "stream", self.raw)
         if self.resize_handler is not None:
             import signal
             signal.signal(signal.SIGWINCH, self.resize_handler)

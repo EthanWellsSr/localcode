@@ -148,6 +148,50 @@ class TerminalTextTests(unittest.TestCase):
         self.assertEqual(screen.offset, 0)
         self.assertIn("new output", screen.raw.getvalue())
 
+    def test_resize_during_a_write_waits_for_it(self):
+        class SlowTerminal:
+            """Like the real stdout: writing again while a write is still going raises RuntimeError."""
+            def __init__(self):
+                self.log, self.busy, self.on_first_write = [], False, None
+
+            def write(self, s):
+                if self.busy:
+                    raise RuntimeError("reentrant call inside <_io.BufferedWriter name='<stdout>'>")
+                self.busy = True
+                try:
+                    if self.on_first_write:
+                        resize, self.on_first_write = self.on_first_write, None
+                        resize()  # SIGWINCH arriving while this write waits on the terminal
+                    self.log.append(s)
+                finally:
+                    self.busy = False
+
+            def flush(self):
+                pass
+
+        terminal = SlowTerminal()
+        screen = lc.Screen(lc.Agent("example", lc.Tools(tempfile.gettempdir())))
+        screen.active, screen.raw = True, lc.TerminalWriter(terminal)
+        screen.rec = lc.Transcript(screen.raw, screen)
+        terminal.on_first_write = screen.on_resize
+        with patch.object(lc.shutil, "get_terminal_size", return_value=os.terminal_size((40, 20))):
+            screen._layout()
+            screen.rec.write("hello\n")
+        self.assertEqual(terminal.log[0], "hello\n")
+        redraw = next(i for i, s in enumerate(terminal.log) if "\033[2J" in s)
+        self.assertGreater(redraw, 0)  # the redraw came after the write, and included the new line
+        self.assertIn("hello", "".join(terminal.log[redraw:]))
+        self.assertIsNone(screen.raw.deferred)
+        self.assertEqual(screen.raw.depth, 0)
+        # Without the TerminalWriter, the same resize crashes the way it did in CI.
+        terminal = SlowTerminal()
+        screen.raw = terminal
+        screen.rec = lc.Transcript(terminal, screen)
+        terminal.on_first_write = screen.on_resize
+        with patch.object(lc.shutil, "get_terminal_size", return_value=os.terminal_size((40, 20))):
+            with self.assertRaisesRegex(RuntimeError, "reentrant call"):
+                screen.rec.write("hello\n")
+
     def test_unicode_fits_terminal_cells(self):
         text = "\033[36m项目 cafe\u0301\033[0m"
         self.assertEqual(lc.visible_len(text), 9)
@@ -717,6 +761,35 @@ with <a href="https://pypi.org/">PyPI</a>.</p>
         self.assertIn(f"└ Fetched {url}", out.getvalue())
 
 
+def finish_session(process, master, output, timeout=5):
+    """Keep reading the terminal until localcode exits: if nobody reads, a full pty buffer blocks its last
+    writes and it never exits. If it hangs anyway, SIGABRT makes it print every thread's stack
+    (PYTHONFAULTHANDLER=1 in its environment), which ends up in output for the failure message."""
+    import select
+    import signal
+    import time
+
+    def drain(seconds):
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if not select.select([master], [], [], 0.05)[0]:
+                if process.poll() is not None:
+                    return
+                continue
+            try:
+                chunk = os.read(master, 65536)
+            except OSError:
+                return
+            if not chunk:
+                return
+            output.extend(chunk)
+    drain(timeout)
+    if process.poll() is None:
+        process.send_signal(signal.SIGABRT)
+        drain(3)
+        process.wait(timeout=5)
+
+
 FAKE_BACKEND = r'''
 import localcode as lc
 def fake(path, payload=None, stream=False):
@@ -820,7 +893,7 @@ lc.main()
                 master, slave = pty.openpty()
                 original = termios.tcgetattr(slave)
                 fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
-                env = dict(os.environ, XDG_CONFIG_HOME=directory, TERM="xterm-256color")
+                env = dict(os.environ, XDG_CONFIG_HOME=directory, TERM="xterm-256color", PYTHONFAULTHANDLER="1")
                 env.pop("NO_COLOR", None)
                 process = subprocess.Popen([sys.executable, "-c", backend, "-C", directory],
                                            stdin=slave, stdout=slave, stderr=slave, env=env)
@@ -867,7 +940,8 @@ lc.main()
                     wait_for("\x1b[?2004h")
                     os.write(master, b"\x04")
                     wait_for("\x1b[?1049l")
-                    process.wait(timeout=5)
+                    finish_session(process, master, output)
+                    self.assertEqual(process.returncode, 0, output[-3000:].decode(errors="replace"))
                     restored = termios.tcgetattr(slave)
                     pending = getattr(termios, "PENDIN", 0)
                     restored[3] &= ~pending
@@ -900,7 +974,8 @@ lc.main()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
         output = bytearray()
         with tempfile.TemporaryDirectory() as directory:
-            env = dict(os.environ, XDG_CONFIG_HOME=directory, TERM="xterm-256color")
+            # PYTHONFAULTHANDLER: if localcode hangs, SIGABRT makes it print every thread's stack.
+            env = dict(os.environ, XDG_CONFIG_HOME=directory, TERM="xterm-256color", PYTHONFAULTHANDLER="1")
             env.pop("NO_COLOR", None)
             backend = FAKE_BACKEND.replace('lc.main()', """
 original_fake = lc.ollama
@@ -986,8 +1061,8 @@ lc.main()
                 time.sleep(0.1)
                 os.write(master, b"\x03")
                 wait_for("\x1b[?1049l")
-                process.wait(timeout=5)
-                self.assertEqual(process.returncode, 0)
+                finish_session(process, master, output)
+                self.assertEqual(process.returncode, 0, output[-3000:].decode(errors="replace"))
                 restored = termios.tcgetattr(slave)
                 # Darwin may set PENDIN when canonical input is restored; this
                 # kernel-managed flag schedules pending input for reprinting.
