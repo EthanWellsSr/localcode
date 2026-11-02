@@ -36,7 +36,7 @@ OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/"
 if not OLLAMA_HOST.startswith("http"):
     OLLAMA_HOST = "http://" + OLLAMA_HOST
 DEFAULT_MODEL = "gpt-oss:20b"
-VERSION = "0.6.6"
+VERSION = "0.6.7"
 NUM_CTX = int(os.environ.get("LOCALCODE_NUM_CTX", "32768"))
 MAX_STEPS = 40
 SHOW_THINKING = os.environ.get("LOCALCODE_SHOW_THINKING") == "1"  # else collapsed to "Thought for Ns"
@@ -1925,34 +1925,42 @@ class Screen:
                 self.rec.flush()
 
             echo(question)
-            answer = ""
-            while True:
-                for key in self.read_busy_keys(0.1):
-                    if self.scroll_key(key):
-                        continue
-                    typed = isinstance(key, str) and len(key) == 1 and " " <= key <= "~"
-                    if not (typed or key in ("\r", "\n", "\x7f", "\x08", "\x04")):
-                        continue
-                    with self.lock:
-                        if self.offset:
-                            self.offset = 0
-                            self.render_view()
-                            self.draw_frame()
-                        if key in ("\r", "\n"):
-                            echo("\n")
-                            return answer
-                        if key == "\x04":
-                            if answer:
-                                continue
-                            echo("\n")
-                            raise EOFError
-                        if typed:
-                            answer += key
-                            echo(key)
-                        elif answer:
-                            answer = answer[:-1]
-                            self.rec.cur = self.rec.cur[:-1]
-                            self._w("\b \b")
+            self._w("\033[?25h")  # the cursor shows where the answer goes
+            try:
+                return self._read_answer(echo)
+            finally:
+                self._w("\033[?25l")
+
+    def _read_answer(self, echo):
+        """Read an approval answer from raw keys; the wheel and PgUp/PgDn scroll in the meantime."""
+        answer = ""
+        while True:
+            for key in self.read_busy_keys(0.1):
+                if self.scroll_key(key):
+                    continue
+                typed = isinstance(key, str) and len(key) == 1 and " " <= key <= "~"
+                if not (typed or key in ("\r", "\n", "\x7f", "\x08", "\x04")):
+                    continue
+                with self.lock:
+                    if self.offset:
+                        self.offset = 0
+                        self.render_view()
+                        self.draw_frame()
+                    if key in ("\r", "\n"):
+                        echo("\n")
+                        return answer
+                    if key == "\x04":
+                        if answer:
+                            continue
+                        echo("\n")
+                        raise EOFError
+                    if typed:
+                        answer += key
+                        echo(key)
+                    elif answer:
+                        answer = answer[:-1]
+                        self.rec.cur = self.rec.cur[:-1]
+                        self._w("\b \b")
 
     def run_agent(self, text):
         """Keep wheel/page input out of terminal echo while the model and tools run."""
@@ -1989,6 +1997,7 @@ class Screen:
         self.busy_pending = ""
         self.busy = True
         termios.tcsetattr(self.busy_fd, termios.TCSADRAIN, self.busy_raw)
+        self._w("\033[?25l")  # nothing to type while the model works; the cursor would sit in the output
         try:
             thread.start()
             return self.agent.run(text)
@@ -2001,6 +2010,7 @@ class Screen:
             with self.lock:
                 self.offset = 0
                 self.redraw_all()
+            self._w("\033[?25h")
 
     def status_text(self):
         a = self.agent
@@ -2412,7 +2422,7 @@ class Screen:
         except OSError:
             pass
         # Mouse and paste modes off, scroll region released, and back to the screen from before.
-        self._w("\033[?1006l\033[?1000l\033[?2004l\033[r\033[?1049l")
+        self._w("\033[?25h\033[?1006l\033[?1000l\033[?2004l\033[r\033[?1049l")
 
 
 def main():

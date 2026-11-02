@@ -914,9 +914,12 @@ lc.main()
 
                 try:
                     wait_for("Ask about this project")
+                    sent = len(output)
                     os.write(master, scenario.encode() + b"\r")
                     if scenario == "approve":
                         wait_for("[Y]es / [n]o / [a]lways for this tool:")
+                        wait_for("\x1b[?25h")  # the cursor shows where the answer goes
+                        self.assertIn(b"\x1b[?25l", output[sent:])  # hidden while the model worked
                         self.assertFalse(termios.tcgetattr(slave)[3] & termios.ECHO)
                         # The wheel and PgUp scroll back through the diff while the prompt waits.
                         for chunk in (b"\x1b[<64;", b"10;10M", b"\x1b[5~"):
@@ -934,6 +937,7 @@ lc.main()
                         os.write(master, b"\x04")
                     elif scenario == "interrupt":
                         wait_for("interrupt ready")
+                        self.assertIn(b"\x1b[?25l", output[sent:])  # no cursor floating in the output
                         self.assertFalse(termios.tcgetattr(slave)[3] & termios.ECHO)
                         process.send_signal(signal.SIGINT)
                     wait_for(expected)
@@ -951,6 +955,7 @@ lc.main()
                     self.assertNotIn(b"Traceback", output)
                     # Mouse reporting stays on until exit, so the terminal never scrolls its own history.
                     self.assertEqual(output.count(b"\x1b[?1000l"), 1)
+                    self.assertGreater(output.rfind(b"\x1b[?25h"), output.rfind(b"\x1b[?25l"))  # cursor back
                     self.assertNotIn(b"^[[<", output)
                 finally:
                     if process.poll() is None:

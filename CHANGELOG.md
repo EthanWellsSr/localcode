@@ -2,6 +2,11 @@
 
 Each version is a git tag. `localcode --version`, the header and `/status` show the version you're running.
 
+## v0.6.7 — 2026-11-02
+
+- The cursor is hidden while the model works, instead of sitting at the end of the output. It shows at an approval prompt while you answer, and in the input box once the model is done.
+- The hint under the input box no longer mentions PgUp (the mouse wheel and PgUp still scroll).
+
 ## v0.6.6 — 2026-11-02
 
 - Fix a crash when the window is resized while localcode is writing to a slow terminal: the redraw now waits until the write finishes instead of failing with "reentrant call". This was also why CI failed now and then.

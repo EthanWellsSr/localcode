@@ -72,7 +72,7 @@ Start with a task, or explore before making changes.
 ❯ Ask about this project…  / commands
 ────────────────────────────────────────────────────────────────────────────────
   gpt-oss:20b · ask to edit · ▱▱▱▱▱▱▱▱ 0% context
-  / commands · ↑↓ history · PgUp scroll · Ctrl-C clear / quit
+  / commands · Ctrl-R history · Shift-Enter newline
 ```
 
 Replies are rendered as Markdown while they stream: headings and **bold** in bold, `code` in color, bullets as •, code blocks with a side bar, and tables drawn as aligned boxes that fit the terminal width. When output is piped instead of shown in a terminal, the raw Markdown is passed through.
