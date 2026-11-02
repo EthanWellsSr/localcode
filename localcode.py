@@ -100,9 +100,7 @@ class Spinner:
     def _write(self, text):
         screen = getattr(sys.stdout, "screen", None)
         if screen:
-            with screen.lock:
-                if not screen.offset:
-                    screen._w(text)
+            screen.write_transient(text)
         else:
             out = term_out()
             out.write(text)
@@ -1351,6 +1349,7 @@ class Screen:
         self.input_rows = 1
         self.lock = threading.RLock()
         self.input_lock = threading.Lock()
+        self.prompt_waiting = threading.Event()
         self.busy = False
 
     # ---- layout
@@ -1461,6 +1460,12 @@ class Screen:
             out += f"\033[{self.top + len(shown)};{min(self.w, visible_len(shown[-1]) + 1)}H"
         self._w(out)
 
+    def write_transient(self, text):
+        """Draw output that isn't kept in the conversation (the spinner), unless scrolled back."""
+        with self.lock:
+            if not self.offset:
+                self._w(text)
+
     def scroll(self, rows):
         with self.lock:
             self.offset = max(0, self.offset + rows)
@@ -1475,7 +1480,9 @@ class Screen:
             yield
             return
         import termios
+        self.prompt_waiting.set()  # the scroll reader steps aside instead of re-taking the lock
         with self.input_lock:
+            self.prompt_waiting.clear()
             with self.lock:
                 self.offset = 0
                 self.render_view()
@@ -1509,6 +1516,9 @@ class Screen:
         def read_scroll():
             pending = ""
             while not done.is_set():
+                if self.prompt_waiting.is_set():
+                    done.wait(0.01)
+                    continue
                 with self.input_lock:
                     if done.is_set():
                         break
@@ -1529,10 +1539,9 @@ class Screen:
                             if key.startswith("page"):
                                 amount *= max(1, self.bottom - self.top - 2)
                             self.scroll(amount)
-                # Allow an approval prompt waiting for input ownership to proceed.
-                done.wait(0.001)
 
         thread = threading.Thread(target=read_scroll, daemon=True)
+        self.prompt_waiting.clear()  # an interrupted prompt may have left it set
         self.busy = True
         termios.tcsetattr(self.busy_fd, termios.TCSADRAIN, self.busy_raw)
         try:
