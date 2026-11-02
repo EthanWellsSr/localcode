@@ -284,6 +284,121 @@ class StuckModelTests(unittest.TestCase):
         self.assertTrue(all(f.endswith("\033[K") for f in frames), frames)
 
 
+class PlanModeTests(unittest.TestCase):
+    """/plan: the model can look around and propose, but nothing changes until plan mode is turned off."""
+
+    def test_plan_mode_allows_looking_but_not_changing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "a.txt").write_text("hello\n")
+            tools = lc.Tools(directory, auto_approve=True)
+            tools.plan = True
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertIn("hello", tools.call("read_file", {"path": "a.txt"}))
+                self.assertIn("a.txt", tools.call("list_dir", {}))
+                self.assertIn("a.txt", tools.call("glob", {"pattern": "*.txt"}))
+                self.assertTrue(tools.call("bash", {"command": "cat a.txt | wc -l && ls"}).startswith("exit code 0"))
+                for name, args in (("write_file", {"path": "b.txt", "content": "x"}),
+                                   ("edit_file", {"path": "a.txt", "old_string": "hello", "new_string": "bye"}),
+                                   ("bash", {"command": "rm a.txt"}), ("bash", {"command": "pytest"}),
+                                   ("bash", {"command": "git add ."}),
+                                   ("bash", {"command": "libreoffice --convert-to pdf a.txt"})):
+                    self.assertEqual(tools.call(name, args), lc.PLAN_REFUSAL, (name, args))
+            self.assertEqual((Path(directory) / "a.txt").read_text(), "hello\n")
+            self.assertFalse((Path(directory) / "b.txt").exists())
+
+    def test_wording_alone_never_blocks_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tools = lc.Tools(directory, auto_approve=True)
+            agent = lc.Agent("example", tools)
+            write = {"function": {"name": "write_file", "arguments": {"path": "out.txt", "content": "x\n"}}}
+            replies = iter([[{"message": {"tool_calls": [write]}}, {"done": True}],
+                            [{"message": {"content": "Done."}}, {"done": True}]])
+            with patch.object(lc, "ollama", lambda path, payload=None, stream=False: iter(next(replies))), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                agent.run("write out.txt, let me know you understand before taking any action")
+            self.assertTrue((Path(directory) / "out.txt").exists())  # only /plan holds changes back
+
+    def test_agent_plans_then_acts_after_plan_mode_is_off(self):
+        with tempfile.TemporaryDirectory() as directory:
+            write = {"function": {"name": "write_file", "arguments": {"path": "out.txt", "content": "done\n"}}}
+            replies = iter([
+                [{"message": {"tool_calls": [write]}}, {"done": True}],
+                [{"message": {"content": "Plan: write out.txt."}}, {"done": True}],
+                [{"message": {"content": "Still the plan: write out.txt."}}, {"done": True}],
+                [{"message": {"tool_calls": [write]}}, {"done": True}],
+                [{"message": {"content": "Wrote it."}}, {"done": True}],
+            ])
+            payloads = []
+
+            def fake(path, payload=None, stream=False):
+                payloads.append(json.loads(json.dumps(payload)))
+                return iter(next(replies))
+            tools = lc.Tools(directory, auto_approve=True)
+            agent = lc.Agent("example", tools)
+            tools.plan = True
+            with patch.object(lc, "ollama", fake), contextlib.redirect_stdout(io.StringIO()):
+                agent.run("write out.txt")
+                self.assertFalse((Path(directory) / "out.txt").exists())
+                self.assertEqual(agent.messages[-2]["content"], lc.PLAN_REFUSAL)
+                agent.run("sounds right")
+                self.assertFalse((Path(directory) / "out.txt").exists())
+                tools.plan = False
+                agent.run("go ahead")
+            self.assertEqual((Path(directory) / "out.txt").read_text(), "done\n")
+
+            def notes(payload):
+                return [m["content"] for m in payload["messages"] if m["role"] == "system"][1:]
+            self.assertEqual(notes(payloads[0]), [lc.PLAN_NOTE])
+            self.assertEqual(notes(payloads[2]), [lc.PLAN_NOTE])  # not repeated each turn
+            self.assertEqual(notes(payloads[3]), [lc.PLAN_OFF_NOTE])
+            self.assertEqual(notes(payloads[4]), [lc.PLAN_OFF_NOTE])
+            agent.messages.append({"role": "user", "content": "x"})
+            self.assertNotIn("Plan mode", lc.conversation_markdown(agent))
+
+    def test_plan_mode_shows_in_status_and_toggles(self):
+        tools = lc.Tools(tempfile.gettempdir())
+        screen = lc.Screen(lc.Agent("example", tools))
+        screen.w = 100
+        tools.plan = True
+        self.assertIn("plan mode", screen.status_text())
+        self.assertIn("/plan to let it make changes", screen.hint_text())
+        with tempfile.TemporaryDirectory() as directory:
+            env = dict(os.environ, XDG_CONFIG_HOME=directory, NO_COLOR="1")
+            result = subprocess.run(
+                [sys.executable, "-c", FAKE_BACKEND, "--plain", "-C", directory],
+                input="/plan\n/status\n/plan\n/status\n/exit\n", text=True, capture_output=True, env=env, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("Plan mode on:", result.stdout)
+            self.assertIn("On: read and search only (/plan)", result.stdout)
+            self.assertIn("Plan mode off:", result.stdout)
+            self.assertIn("Plan mode            Off", result.stdout.split("Plan mode off:")[1])
+
+
+class ReasoningHistoryTests(unittest.TestCase):
+    def test_reasoning_is_sent_back_between_tool_calls_then_dropped(self):
+        payloads = []
+        replies = iter([
+            [{"message": {"thinking": "Need to look "}}, {"message": {"thinking": "at the folder."}},
+             {"message": {"tool_calls": [{"function": {"name": "list_dir", "arguments": {}}}]}}, {"done": True}],
+            [{"message": {"thinking": "Two files."}}, {"message": {"content": "There are two files."}}, {"done": True}],
+            [{"message": {"content": "Hi again."}}, {"done": True}],
+        ])
+
+        def fake(path, payload=None, stream=False):
+            payloads.append(json.loads(json.dumps(payload)))
+            return iter(next(replies))
+        agent = lc.Agent("example", lc.Tools(tempfile.gettempdir()))
+        with patch.object(lc, "ollama", fake), contextlib.redirect_stdout(io.StringIO()):
+            agent.run("what's here?")
+            agent.run("thanks")
+        during = [m for m in payloads[1]["messages"] if m["role"] == "assistant"]
+        self.assertEqual(during[-1]["thinking"], "Need to look at the folder.")
+        self.assertTrue(all("thinking" not in m for m in payloads[2]["messages"]))
+        final = [m for m in agent.messages if m["role"] == "assistant"]
+        self.assertEqual(final[1]["content"], "There are two files.")
+        self.assertNotIn("thinking", final[1])  # a final answer's reasoning isn't kept
+
+
 class AutoModeTests(unittest.TestCase):
     """/auto approves what is clearly safe and still asks about everything else."""
 

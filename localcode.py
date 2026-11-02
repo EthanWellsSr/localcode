@@ -36,7 +36,7 @@ OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/"
 if not OLLAMA_HOST.startswith("http"):
     OLLAMA_HOST = "http://" + OLLAMA_HOST
 DEFAULT_MODEL = "gpt-oss:20b"
-VERSION = "0.6.3"
+VERSION = "0.6.4"
 NUM_CTX = int(os.environ.get("LOCALCODE_NUM_CTX", "32768"))
 MAX_STEPS = 40
 SHOW_THINKING = os.environ.get("LOCALCODE_SHOW_THINKING") == "1"  # else collapsed to "Thought for Ns"
@@ -601,7 +601,15 @@ def _safe_git_push(args):
     return (len(args) <= 2 and all(not a.startswith(("-", "+")) and ":" not in a for a in args))
 
 
-def is_safe_command(command, root, request=""):
+READ_ONLY_TOOLS = {"read_file", "read_files", "list_dir", "glob", "grep", "web_fetch"}
+PLAN_REFUSAL = ("Not run: plan mode is on, so you can only read and search. Reply with what you understood and "
+                "your plan; the user turns plan mode off with /plan when they want you to make changes.")
+PLAN_NOTE = ("Plan mode is on: you can read files, search and run read-only commands, but nothing that changes "
+             "anything. Look around as needed, then reply with what you understood and your plan, and wait.")
+PLAN_OFF_NOTE = "Plan mode is off now: you can make changes, with the user's usual approvals."
+
+
+def is_safe_command(command, root, request="", read_only=False):
     """Whether /auto may run a shell command without asking.
 
     Allows read-only commands, git queries, git add and commit, test runs, and a plain git push when the
@@ -626,10 +634,10 @@ def is_safe_command(command, root, request=""):
         else:
             current.append(token)
     commands.append(current)
-    return all(cmd and _safe_simple_command(cmd, root, request) for cmd in commands)
+    return all(cmd and _safe_simple_command(cmd, root, request, read_only) for cmd in commands)
 
 
-def _safe_simple_command(cmd, root, request=""):
+def _safe_simple_command(cmd, root, request="", read_only=False):
     for arg in cmd[1:]:
         value = arg.split("=", 1)[1] if arg.startswith("-") and "=" in arg else arg
         if value.startswith(("/", "~")) or ".." in Path(value).parts:
@@ -648,6 +656,8 @@ def _safe_simple_command(cmd, root, request=""):
             return True
         if sub in GIT_LISTING:
             return all(a in GIT_LISTING[sub] for a in rest)
+        if read_only:
+            return sub == "stash" and rest == ["list"]
         if sub == "add":
             return all(a in ("-A", "--all", "-u", "--update", "-v") or not a.startswith("-") for a in rest)
         if sub == "commit":
@@ -655,7 +665,7 @@ def _safe_simple_command(cmd, root, request=""):
         if sub == "push":
             return asked_to_push(request) and _safe_git_push(rest)
         return sub == "stash" and rest == ["list"]
-    return any(cmd[:len(t)] == t for t in TEST_COMMANDS)
+    return not read_only and any(cmd[:len(t)] == t for t in TEST_COMMANDS)
 
 
 class Tools:
@@ -666,6 +676,7 @@ class Tools:
         self.always = set()  # tool names approved for the rest of the session
         self.seen = {}  # (path, offset) -> (mtime, last line shown, last line asked for) for the repeat-read guard
         self.request = ""  # the user's latest message; /auto pushes only when it asks to
+        self.plan = False  # /plan: only tools that look are allowed
 
     def resolve(self, path):
         p = Path(os.path.expanduser(path or "."))
@@ -895,6 +906,9 @@ class Tools:
             return f"Error: unknown tool {name}. Available: {', '.join(TOOL_NAMES)}"
         if not isinstance(args, dict):
             return "Error: arguments must be a JSON object"
+        if self.plan and not (name in READ_ONLY_TOOLS or (
+                name == "bash" and is_safe_command(str(args.get("command", "")), self.root, read_only=True))):
+            return PLAN_REFUSAL
         try:
             return fn(**args)
         except TypeError as e:
@@ -963,6 +977,8 @@ Top-level files:
 {"Git status:" + chr(10) + git if git else ""}
 Rules:
 - Use tools to look at the code before changing it. Never guess file contents.
+- If the user asks you to confirm your understanding or plan first, look around if you need to, then reply with what you understood and what you will do, and wait for their go-ahead before changing anything. Do the same for large or unclear tasks.
+- Follow the user's instructions about how to work, including ones at the end of a long message.
 - When you need several files (for example to get familiar with a project), read them together with one read_files call.
 - To change an existing file, read it first, then use edit_file with an exact old_string copied from the file (without the line-number prefix).
 - Make one tool call at a time when later steps depend on earlier results.
@@ -1085,6 +1101,7 @@ class Agent:
         self.reset()
 
     def reset(self):
+        self.last_thinking, self.planned = "", False
         prompt, self.instructions = system_prompt(self.tools.root)
         self.messages = [{"role": "system", "content": prompt}]
         self.tools.forget()
@@ -1098,13 +1115,14 @@ class Agent:
         printer = StreamPrinter()
         stats = {}
         spinner = Spinner()
-        think_start = None
+        think_start, thinking = None, ""
         try:
             for chunk in ollama("/api/chat", payload, stream=True):
                 if "error" in chunk:
                     raise RuntimeError(chunk["error"])
                 msg = chunk.get("message", {})
                 if msg.get("thinking"):
+                    thinking += msg["thinking"]
                     # Reasoning models think before answering: keep the spinner going and collapse it to one line.
                     if think_start is None:
                         think_start = time.monotonic()
@@ -1125,7 +1143,7 @@ class Agent:
                     stats = chunk
         finally:
             spinner.stop()
-        content = printer.text
+        content, self.last_thinking = printer.text, thinking
         native = bool(tool_calls)
         if not native:
             tool_calls = parse_text_tool_calls(content)
@@ -1143,13 +1161,24 @@ class Agent:
 
 
     def run(self, user_input):
+        # Reasoning models need their own reasoning between tool calls of a task (without it gpt-oss starts
+        # thinking out loud in its replies), but not from tasks that are finished.
+        for message in self.messages:
+            message.pop("thinking", None)
+        # Only the latest plan-mode note matters; older ones would leave the model thinking it's still planning.
+        self.messages = [m for m in self.messages
+                         if not (m["role"] == "system" and m["content"] in (PLAN_NOTE, PLAN_OFF_NOTE))]
+        if self.tools.plan or self.planned:
+            self.messages.append({"role": "system", "content": PLAN_NOTE if self.tools.plan else PLAN_OFF_NOTE})
+        self.planned = self.tools.plan
         self.messages.append({"role": "user", "content": user_input})
         self.tools.request = user_input
         nudged = False
         for _ in range(MAX_STEPS):
             content, tool_calls, native = self.chat_once()
             self.messages.append({"role": "assistant", "content": content,
-                                  **({"tool_calls": tool_calls} if native else {})})
+                                  **({"tool_calls": tool_calls} if native else {}),
+                                  **({"thinking": self.last_thinking} if tool_calls and self.last_thinking else {})})
             if not tool_calls and not nudged and bare_json_object(content) is not None:
                 # Looks like a tool call with no tool name; ask once rather than stopping silently.
                 nudged = True
@@ -1194,6 +1223,7 @@ COMMANDS = {
     "/copy": "copy the last reply to the clipboard",
     "/export": "save this conversation as Markdown: /export [path]",
     "/clear": "start a fresh conversation",
+    "/plan": "toggle plan mode: the model can only read and search, and replies with a plan",
     "/auto": "toggle auto mode: approve safe edits, commands and fetches, ask about the rest",
     "/yolo": "toggle auto-approve for everything, including risky commands",
     "/help": "show commands and keys",
@@ -1484,6 +1514,7 @@ def show_status(agent):
         ("Approvals", {"yolo": "Auto-approve everything (/yolo)",
                        "auto": "Auto: safe actions approved, risky ones asked (/auto)",
                        "ask": "Ask before writes, commands and web fetches"}[agent.tools.approvals()]),
+        ("Plan mode", "On: read and search only (/plan)" if agent.tools.plan else "Off"),
         ("Allowed this session", ", ".join(sorted(agent.tools.always)) or "None"),
     ]:
         print("  " + dim(f"{label:<21}") + value)
@@ -1944,7 +1975,7 @@ class Screen:
         approvals = {"yolo": yellow("auto-approve"), "auto": cyan("auto mode"),
                      "ask": green("ask to edit")}[a.tools.approvals()]
         model = abbreviate(a.model, max(4, self.w // 3))
-        parts = [model, approvals, color(f"ctx {pct}%")]
+        parts = [model] + ([yellow("plan mode")] if a.tools.plan else []) + [approvals, color(f"ctx {pct}%")]
         if self.w >= 80:
             filled = min(8, max(0, round(pct * 8 / 100)))
             parts[-1] = color("▰" * filled + "▱" * (8 - filled) + f" {pct}% context")
@@ -1955,6 +1986,8 @@ class Screen:
     def hint_text(self):
         if self.offset:
             return "  " + cyan(f"↑ scrolled back {self.offset} lines") + dim(" · scroll down or PgDn to return")
+        if self.agent.tools.plan:
+            return "  " + yellow("⏸ plan mode: read and search only") + dim(" (/plan to let it make changes)")
         if self.agent.tools.auto_approve:
             return "  " + yellow("⏵⏵ auto-approve on") + dim(" (/yolo to turn off)")
         if self.agent.tools.auto:
@@ -2455,6 +2488,11 @@ def main():
                     elif cmd == "/yolo":
                         tools.auto_approve, tools.auto = not tools.auto_approve, False
                         print(dim(f"Auto-approve {'on' if tools.auto_approve else 'off'}."))
+                    elif cmd == "/plan":
+                        tools.plan = not tools.plan
+                        print(dim("Plan mode on: the model can read and search but not change anything, and will "
+                                  "reply with its plan. /plan again to let it make changes." if tools.plan else
+                                  "Plan mode off: the model can make changes again, with your usual approvals."))
                     elif cmd == "/auto":
                         tools.auto, tools.auto_approve = not tools.auto, False
                         print(dim("Auto mode on: edits in this project, web fetches, read-only commands, test runs and "

@@ -2,6 +2,12 @@
 
 Each version is a git tag. `localcode --version`, the header and `/status` show the version you're running.
 
+## v0.6.4 — 2026-11-02
+
+- Plan mode (`/plan`): the model can read, search, fetch and run read-only commands, and replies with its plan. Anything that changes files or state is refused until you turn plan mode off.
+- The system prompt asks the model to share its understanding first when you ask for that, and on large or unclear tasks, and to follow instructions about how to work even at the end of a long message.
+- Reasoning models get their own reasoning back between the tool calls of a task, which keeps gpt-oss from thinking out loud in its replies. Reasoning from finished tasks is still dropped.
+
 ## v0.6.3 — 2026-11-02
 
 - Auto mode approves `git add` and `git commit -m …`, and a plain `git push` when your latest message asks to push. Force-pushes, deleting branches, pushing tags, amending and skipping hooks still ask.

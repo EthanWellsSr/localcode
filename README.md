@@ -46,6 +46,8 @@ Auto mode (`--auto`, or `/auto` during a session) approves for you when an actio
 
 `--yolo` (or `/yolo`) approves everything, including risky commands.
 
+Plan mode (`/plan`) is for when you want to hear the model's plan before anything changes. While it's on, the model can read files, search, fetch pages and run read-only commands, and it's told to reply with what it understood and what it would do. Writes, edits, installs, test runs, git changes and other commands are refused, whatever the approval mode. The status line shows when it's on; `/plan` again lets the model make changes. Smaller models don't always follow "confirm before you act" in a message, so use plan mode when it matters.
+
 ## Output
 
 localcode runs full-window on the terminal's alternate screen, like `vim` or `htop`: your earlier terminal output is out of view while it runs and comes back unchanged when you quit. A compact header shows the workspace, leaving room for the conversation. The input stays pinned at the bottom, above the model, approval mode, context usage, and last reply's speed. A context meter appears in wider windows; narrow windows use a percentage.
@@ -92,6 +94,7 @@ The model picker is searchable too: type part of a name, parameter size, or `nat
 | `/copy` | Copy the last assistant reply to the clipboard (`pbcopy` on macOS) |
 | `/export [path]` | Save a Markdown conversation; defaults to a timestamped file in the workspace and refuses to overwrite files |
 | `/clear` | Start a fresh conversation (re-reads `AGENTS.md`) |
+| `/plan` | Toggle plan mode: the model can only read and search, and replies with a plan |
 | `/auto` | Toggle auto mode: approve safe edits, commands and fetches, ask about the rest |
 | `/yolo` | Toggle auto-approve for everything, including risky commands |
 | `/help` | Show commands and keys |
