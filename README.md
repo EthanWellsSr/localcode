@@ -46,7 +46,7 @@ localcode runs full-window on the terminal's alternate screen, like `vim` or `ht
 
 The welcome screen offers starter tasks and tells you whether project instructions were loaded. Try `/status` for the full session details, including your Ollama address. It doesn't call the model or consume context.
 
-Scroll back through the conversation with the mouse wheel, PgUp/PgDn or Shift+↑/↓. Because the mouse wheel is handled by localcode, selecting text with the mouse needs your terminal's override key held while dragging (Fn in Terminal.app, Option in iTerm2). Use `--plain` if you prefer native terminal scrolling, selection, or a simpler display. `NO_COLOR=1` also uses inline prompts without color. Piped output stays plain Markdown.
+Scroll back through the conversation with the mouse wheel, PgUp/PgDn or Shift+↑/↓, including while the model is thinking or streaming. Output is kept while you scroll; scroll down or press PgDn to return to the newest output. Because the mouse wheel is handled by localcode, selecting text with the mouse needs your terminal's override key held while dragging (Fn in Terminal.app, Option in iTerm2). Use `--plain` if you prefer native terminal scrolling, selection, or a simpler display. `NO_COLOR=1` also uses inline prompts without color. Piped output stays plain Markdown.
 
 Reasoning models' thinking is collapsed to a single "✻ Thought for Ns" line (set `LOCALCODE_SHOW_THINKING=1` to see it).
 

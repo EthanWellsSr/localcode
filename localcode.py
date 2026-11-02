@@ -12,6 +12,7 @@ back to parsing JSON tool calls out of plain text for models that do that.
 
 import argparse
 import atexit
+from contextlib import contextmanager, nullcontext
 import difflib
 import fnmatch
 import json
@@ -92,13 +93,20 @@ class Spinner:
         i = 0
         while not self.done.wait(0.1):
             elapsed = int(time.monotonic() - start)
-            out = term_out()
-            out.write("\r" + dim(f"{self.FRAMES[i % len(self.FRAMES)]} {self.label}… {elapsed}s"))
-            out.flush()
+            self._write("\r" + dim(f"{self.FRAMES[i % len(self.FRAMES)]} {self.label}… {elapsed}s"))
             i += 1
-        out = term_out()
-        out.write("\r\033[K")
-        out.flush()
+        self._write("\r\033[K")
+
+    def _write(self, text):
+        screen = getattr(sys.stdout, "screen", None)
+        if screen:
+            with screen.lock:
+                if not screen.offset:
+                    screen._w(text)
+        else:
+            out = term_out()
+            out.write(text)
+            out.flush()
 
     def stop(self):
         if self.thread and not self.done.is_set():
@@ -1216,14 +1224,25 @@ class Transcript:
     MAX_LINES = 5000
     TOKEN = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\r\n|\n|\r|\x1b|[^\x1b\r\n]+")
 
-    def __init__(self, raw):
+    def __init__(self, raw, screen=None):
         self.raw = raw
+        self.screen = screen
         self.lines, self.cur = [], ""
 
     def write(self, s):
-        self.raw.write(s)
+        with self.screen.lock if self.screen else nullcontext():
+            return self._write(s)
+
+    def _write(self, s):
+        screen = self.screen
+        if not screen or not screen.offset:
+            self.raw.write(s)
+        width = screen.w if screen else 80
+        added_rows = -len(hard_wrap(self.cur, width)) if screen and screen.offset else 0
         for tok in self.TOKEN.findall(s):
             if tok in ("\n", "\r\n"):
+                if screen and screen.offset:
+                    added_rows += len(hard_wrap(self.cur, width))
                 self._newline()
             elif tok == "\r":
                 self.cur = ""  # a carriage return means the line is about to be overwritten
@@ -1232,6 +1251,8 @@ class Transcript:
                     self.cur += tok  # keep colors; other cursor/erase codes aren't part of the text
             elif tok != "\x1b":
                 self.cur += tok
+        if screen and screen.offset:
+            screen.offset = max(0, screen.offset + added_rows + len(hard_wrap(self.cur, width)))
         return len(s)
 
     def _newline(self):
@@ -1241,7 +1262,11 @@ class Transcript:
             del self.lines[:len(self.lines) - self.MAX_LINES]
 
     def ask(self, question):
-        """A y/n style prompt inside the conversation: mouse reporting off so wheel scrolls don't type garbage."""
+        with self.screen.pause_busy_input() if self.screen else nullcontext():
+            return self._ask(question)
+
+    def _ask(self, question):
+        """A y/n style prompt with mouse reporting off and canonical input restored."""
         self.raw.write("\033[?1000l")
         self.write(question)
         self.flush()
@@ -1250,7 +1275,8 @@ class Transcript:
             if not answer:
                 raise EOFError
         finally:
-            self.raw.write("\033[?1000h")
+            if not (self.screen and self.screen.busy):
+                self.raw.write("\033[?1000h")
         answer = answer.rstrip("\n")
         self.cur += answer  # the terminal echoed it; keep the copy in step
         self._newline()
@@ -1323,6 +1349,9 @@ class Screen:
         self.prefill = ""
         self.choosing = False
         self.input_rows = 1
+        self.lock = threading.RLock()
+        self.input_lock = threading.Lock()
+        self.busy = False
 
     # ---- layout
 
@@ -1332,7 +1361,7 @@ class Screen:
         self.active = True
         self.history = load_editor_history()
         self.raw = sys.stdout
-        self.rec = sys.stdout = Transcript(self.raw)
+        self.rec = sys.stdout = Transcript(self.raw, self)
         atexit.register(self.stop)
         try:
             import signal
@@ -1391,9 +1420,10 @@ class Screen:
     def on_resize(self):
         if not self.active or self.choosing:
             return
-        self.redraw_all()
-        if self.reading:
-            self.render()
+        with self.lock:
+            self.redraw_all()
+            if self.reading:
+                self.render()
 
     def grow(self, n):
         """Make the box n rows taller than normal (for the menu); the conversation view shrinks to fit."""
@@ -1432,8 +1462,91 @@ class Screen:
         self._w(out)
 
     def scroll(self, rows):
-        self.offset = max(0, self.offset + rows)
-        self.render_view()
+        with self.lock:
+            self.offset = max(0, self.offset + rows)
+            self.render_view()
+            if self.busy:
+                self.draw_frame()
+
+    @contextmanager
+    def pause_busy_input(self):
+        """Give tool approval prompts sole ownership of canonical terminal input."""
+        if not self.busy:
+            yield
+            return
+        import termios
+        with self.input_lock:
+            with self.lock:
+                self.offset = 0
+                self.render_view()
+                self.draw_frame()
+            # Discard incomplete mouse reports before enabling echoed line input.
+            self._w("\033[?1000l")
+            termios.tcflush(self.busy_fd, termios.TCIFLUSH)
+            termios.tcsetattr(self.busy_fd, termios.TCSADRAIN, self.busy_saved)
+            try:
+                yield
+            finally:
+                termios.tcsetattr(self.busy_fd, termios.TCSADRAIN, self.busy_raw)
+                self._w("\033[?1000h")
+
+    def run_agent(self, text):
+        """Keep wheel/page input out of terminal echo while the model and tools run."""
+        if not self.active:
+            return self.agent.run(text)
+        import select
+        import termios
+
+        self.busy_fd = sys.stdin.fileno()
+        self.busy_saved = termios.tcgetattr(self.busy_fd)
+        self.busy_raw = termios.tcgetattr(self.busy_fd)
+        # Keep ISIG: Ctrl-C still interrupts the model on the main thread.
+        self.busy_raw[3] &= ~(termios.ICANON | termios.ECHO | termios.IEXTEN)
+        self.busy_raw[0] &= ~(termios.IXON | termios.ICRNL)
+        self.busy_raw[6][termios.VMIN], self.busy_raw[6][termios.VTIME] = 1, 0
+        done = threading.Event()
+
+        def read_scroll():
+            pending = ""
+            while not done.is_set():
+                with self.input_lock:
+                    if done.is_set():
+                        break
+                    if not select.select([self.busy_fd], [], [], 0.05)[0]:
+                        continue
+                    chunk = os.read(self.busy_fd, 4096)
+                    if not chunk:
+                        break
+                    pending += chunk.decode("utf-8", errors="replace")
+                    while pending:
+                        if pending == "\x1b" or (pending.startswith("\x1b[") and
+                                                not re.search(r"[@-~]", pending[2:])):
+                            break
+                        key, end = self._next_key(pending, 0)
+                        pending = pending[end:]
+                        if key in self.SCROLL_KEYS:
+                            amount = self.SCROLL_KEYS[key]
+                            if key.startswith("page"):
+                                amount *= max(1, self.bottom - self.top - 2)
+                            self.scroll(amount)
+                # Allow an approval prompt waiting for input ownership to proceed.
+                done.wait(0.001)
+
+        thread = threading.Thread(target=read_scroll, daemon=True)
+        self.busy = True
+        termios.tcsetattr(self.busy_fd, termios.TCSADRAIN, self.busy_raw)
+        try:
+            thread.start()
+            return self.agent.run(text)
+        finally:
+            done.set()
+            if thread.ident is not None:
+                thread.join()
+            termios.tcsetattr(self.busy_fd, termios.TCSADRAIN, self.busy_saved)
+            self.busy = False
+            with self.lock:
+                self.offset = 0
+                self.redraw_all()
 
     def status_text(self):
         a = self.agent
@@ -1956,7 +2069,7 @@ def main():
                 print(red(f"Command failed: {e}") + dim(" Try again, or /exit to quit."))
                 continue
             try:
-                agent.run(text)
+                screen.run_agent(text)
             except KeyboardInterrupt:
                 print(yellow("\nInterrupted."))
             except (urllib.error.URLError, RuntimeError) as e:

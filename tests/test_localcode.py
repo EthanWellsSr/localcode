@@ -129,6 +129,24 @@ class TerminalTextTests(unittest.TestCase):
                                    ("\x1b[13u", "\r"), ("\x1b[13;2:3u", "unknown")):
             self.assertEqual(screen._next_key(sequence, 0), (expected, len(sequence)))
 
+    def test_streaming_and_spinner_preserve_scrolled_view(self):
+        screen = self.composer("")
+        screen.reading, screen.busy = False, True
+        screen.rec = lc.Transcript(screen.raw, screen)
+        screen.rec.lines = ["line " + str(i) for i in range(40)]
+        screen.scroll(3)
+        offset = screen.offset
+        screen.raw.seek(0)
+        screen.raw.truncate()
+        screen.rec.write("new output\n")
+        with patch.object(lc.sys, "stdout", screen.rec):
+            lc.Spinner.__new__(lc.Spinner)._write("spinner update")
+        self.assertEqual(screen.raw.getvalue(), "")
+        self.assertEqual(screen.offset, offset + 1)
+        screen.scroll(-1000)
+        self.assertEqual(screen.offset, 0)
+        self.assertIn("new output", screen.raw.getvalue())
+
     def test_unicode_fits_terminal_cells(self):
         text = "\033[36m项目 cafe\u0301\033[0m"
         self.assertEqual(lc.visible_len(text), 9)
@@ -244,6 +262,85 @@ lc.main()
         self.assertNotIn("Can't reach Ollama", result.stderr)
 
     @unittest.skipUnless(sys.platform != "win32", "requires a POSIX pseudo-terminal")
+    def test_busy_approval_error_and_interrupt_restore_terminal(self):
+        import fcntl
+        import pty
+        import select
+        import signal
+        import struct
+        import termios
+        import time
+
+        backend = FAKE_BACKEND.replace('lc.main()', """
+import time
+def run(self, text):
+    if text == "approve":
+        accepted = self.tools.confirm("test", "permission test")
+        print("approval accepted" if accepted else "approval rejected", flush=True)
+    elif text == "fail":
+        raise RuntimeError("simulated failure")
+    else:
+        print("interrupt ready", flush=True)
+        time.sleep(30)
+lc.Agent.run = run
+lc.main()
+""")
+        for scenario, expected in (("approve", "approval accepted"), ("fail", "Model error:"),
+                                   ("interrupt", "Interrupted.")):
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as directory:
+                master, slave = pty.openpty()
+                original = termios.tcgetattr(slave)
+                fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
+                env = dict(os.environ, XDG_CONFIG_HOME=directory, TERM="xterm-256color")
+                env.pop("NO_COLOR", None)
+                process = subprocess.Popen([sys.executable, "-c", backend, "-C", directory],
+                                           stdin=slave, stdout=slave, stderr=slave, env=env)
+                output, cursor = bytearray(), 0
+
+                def wait_for(text):
+                    nonlocal cursor
+                    deadline = time.monotonic() + 5
+                    needle = text.encode()
+                    while time.monotonic() < deadline:
+                        position = output.find(needle, cursor)
+                        if position >= 0:
+                            cursor = position + len(needle)
+                            return
+                        if select.select([master], [], [], 0.05)[0]:
+                            output.extend(os.read(master, 65536))
+                    self.fail("Missing " + repr(text) + "\n" + output.decode(errors="replace"))
+
+                try:
+                    wait_for("Ask about this project")
+                    os.write(master, scenario.encode() + b"\r")
+                    if scenario == "approve":
+                        wait_for("[Y]es / [n]o / [a]lways for this tool:")
+                        self.assertTrue(termios.tcgetattr(slave)[3] & termios.ICANON)
+                        os.write(master, b"y\r")
+                    elif scenario == "interrupt":
+                        wait_for("interrupt ready")
+                        self.assertFalse(termios.tcgetattr(slave)[3] & termios.ECHO)
+                        process.send_signal(signal.SIGINT)
+                    wait_for(expected)
+                    wait_for("\x1b[?2004h")
+                    os.write(master, b"\x04")
+                    wait_for("\x1b[?1049l")
+                    process.wait(timeout=5)
+                    restored = termios.tcgetattr(slave)
+                    pending = getattr(termios, "PENDIN", 0)
+                    restored[3] &= ~pending
+                    original[3] &= ~pending
+                    self.assertEqual(restored, original)
+                    self.assertEqual(process.returncode, 0)
+                    self.assertNotIn(b"Traceback", output)
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                        process.wait()
+                    os.close(master)
+                    os.close(slave)
+
+    @unittest.skipUnless(sys.platform != "win32", "requires a POSIX pseudo-terminal")
     def test_full_screen_paste_scroll_resize_and_exit(self):
         import fcntl
         import pty
@@ -260,7 +357,22 @@ lc.main()
         with tempfile.TemporaryDirectory() as directory:
             env = dict(os.environ, XDG_CONFIG_HOME=directory, TERM="xterm-256color")
             env.pop("NO_COLOR", None)
-            process = subprocess.Popen([sys.executable, "-c", FAKE_BACKEND, "-C", directory],
+            backend = FAKE_BACKEND.replace('lc.main()', """
+original_fake = lc.ollama
+def slow_fake(path, payload=None, stream=False):
+    if path != "/api/chat":
+        return original_fake(path, payload, stream)
+    def chunks():
+        import time
+        print("\\n".join("context line " + str(i) for i in range(30)), flush=True)
+        yield {"message": {"thinking": "checking"}}
+        time.sleep(1)
+        yield from original_fake(path, payload, stream)
+    return chunks()
+lc.ollama = slow_fake
+lc.main()
+""")
+            process = subprocess.Popen([sys.executable, "-c", backend, "-C", directory],
                                        stdin=slave, stdout=slave, stderr=slave, env=env)
 
             search_cursor = 0
@@ -287,6 +399,16 @@ lc.main()
                     os.write(master, chunk)
                     time.sleep(0.05)
                 os.write(master, b"\r")
+                wait_for("thinking…")
+                self.assertFalse(termios.tcgetattr(slave)[3] & termios.ECHO,
+                                 "busy terminal must not echo mouse reports")
+                for chunk in (b"\x1b[<65;", b"56;35M", b"\x1b[5~"):
+                    os.write(master, chunk)
+                    time.sleep(0.02)
+                wait_for("scrolled back")
+                fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 70, 0, 0))
+                process.send_signal(signal.SIGWINCH)
+                os.write(master, b"\x1b[6~")
                 wait_for("Received:")
                 wait_for("\x1b[?2004h")
                 os.write(master, b"/status\r")
@@ -329,6 +451,8 @@ lc.main()
                 original[3] &= ~pending_input
                 self.assertEqual(restored, original)
                 self.assertNotIn(b"Traceback", output)
+                self.assertNotIn(b"^[[<", output)
+                self.assertNotIn(b"\x1b[<65;56;35M", output)
                 self.assertEqual(output.count(b"\x1b[>1u"), output.count(b"\x1b[<u"))
                 history = json.loads((Path(directory) / "localcode/history.jsonl").read_text().splitlines()[0])
                 self.assertEqual(history, "项目\nhello")
