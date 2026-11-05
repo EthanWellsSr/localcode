@@ -547,6 +547,8 @@ class AutoModeTests(unittest.TestCase):
                 self.assertEqual(tools.bash("echo hello"), "exit code 0\nhello")
                 self.assertEqual(tools.write_file("notes/a.txt", "one\n"), "Wrote 1 lines to notes/a.txt")
                 self.assertTrue(tools.edit_file("notes/a.txt", "one", "two").startswith("Edited"))
++                # cd command should be auto-approved
++                self.assertEqual(tools.bash("cd subdir"), "exit code 0")
                 self.assertEqual(asked, [])
                 self.assertEqual(out.getvalue().count("auto-approved"), 3)
                 self.assertEqual(tools.bash("rm notes/a.txt"), "User denied the command.")

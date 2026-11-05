@@ -592,7 +592,7 @@ def page_text(body, content_type, url):
 # ---------------------------------------------------------------- tools
 
 # What /auto runs without asking: commands that only read, git queries, and the project's tests.
-SAFE_COMMANDS = {"ls", "pwd", "cat", "head", "tail", "wc", "grep", "rg", "find", "tree", "file", "stat", "du",
+SAFE_COMMANDS = {"ls", "pwd", "cd", "cat", "head", "tail", "wc", "grep", "rg", "find", "tree", "file", "stat", "du",
                  "which", "echo", "diff", "sort", "cut", "basename", "dirname", "date", "uname", "true"}
 UNSAFE_FLAGS = {"find": {"-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprint0", "-fprintf", "-fls"},
                 "sort": {"-o", "--output"}, "rg": {"--pre"}, "tail": {"-f", "-F", "--follow"}}
