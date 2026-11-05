@@ -2,6 +2,10 @@
 
 Each version is a git tag. `localcode --version`, the header and `/status` show the version you're running.
 
+## v0.7.0 — 2026-11-05
+
+- Enter `!<command>` to run a shell command in the project directory. Its output and exit status appear in the chat and are sent to the model as context.
+
 ## v0.6.7 — 2026-11-02
 
 - The cursor is hidden while the model works, instead of sitting at the end of the output. It shows at an approval prompt while you answer, and in the input box once the model is done.

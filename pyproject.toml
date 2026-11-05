@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "localcode"
-version = "0.6.7"
+version = "0.7.0"
 description = "A terminal coding agent built around local Ollama models"
 readme = "README.md"
 requires-python = ">=3.9"

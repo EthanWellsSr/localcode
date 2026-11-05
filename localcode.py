@@ -36,7 +36,7 @@ OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/"
 if not OLLAMA_HOST.startswith("http"):
     OLLAMA_HOST = "http://" + OLLAMA_HOST
 DEFAULT_MODEL = "gpt-oss:20b"
-VERSION = "0.6.7"
+VERSION = "0.7.0"
 NUM_CTX = int(os.environ.get("LOCALCODE_NUM_CTX", "32768"))
 MAX_STEPS = 40
 SHOW_THINKING = os.environ.get("LOCALCODE_SHOW_THINKING") == "1"  # else collapsed to "Thought for Ns"
@@ -1502,6 +1502,36 @@ def read_input(screen=None):
         return "\n".join(lines).strip()
 
 
+def run_bang_command(text, cwd):
+    """Run an explicit ! command, show its output, and return it as model context."""
+    if not text.startswith("!"):
+        return text
+    command = text[1:].strip()
+    if not command:
+        return ""
+    print(cyan("$ " + command))
+    try:
+        result = subprocess.run(command, shell=True, cwd=str(cwd), stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, timeout=60)
+        output = result.stdout
+        status = f"exit code {result.returncode}"
+    except subprocess.TimeoutExpired as e:
+        output = e.stdout or ""
+        if isinstance(output, bytes):
+            output = output.decode(errors="replace")
+        status = "timed out after 60 seconds"
+    except OSError as e:
+        output, status = "", f"could not run command: {e}"
+    if len(output) > MAX_TOOL_OUTPUT:
+        cut = output.rfind("\n", 0, MAX_TOOL_OUTPUT)
+        cut = cut if cut > 0 else MAX_TOOL_OUTPUT
+        output = output[:cut] + f"\n... (output truncated; {len(output) - cut} more characters)"
+    if output:
+        print(output, end="" if output.endswith("\n") else "\n")
+    print(dim(f"[{status}]"))
+    return f"User ran: {command}\nCommand output:\n{output}\n[{status}]"
+
+
 def fmt_tokens(n):
     return f"{n / 1000:.1f}k" if n >= 1000 else str(n)
 
@@ -2480,6 +2510,7 @@ def main():
             except (EOFError, KeyboardInterrupt):
                 print()
                 return
+            text = run_bang_command(text, tools.root)
             if not text:
                 continue
             if screen.active:

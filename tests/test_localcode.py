@@ -15,6 +15,28 @@ import localcode as lc
 
 
 class TerminalTextTests(unittest.TestCase):
+    def test_read_input_preserves_single_line_and_screen_input(self):
+        with patch("builtins.input", return_value="hello"), patch.object(lc, "drop_last_history"):
+            self.assertEqual(lc.read_input(), "hello")
+
+        screen = type("InputScreen", (), {"active": True, "read_line": lambda self: "hello\n"})()
+        self.assertEqual(lc.read_input(screen), "hello")
+
+    def test_bang_command_shows_output_and_returns_it_for_model(self):
+        with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()) as shown:
+            message = lc.run_bang_command("!printf result; exit 3", directory)
+        self.assertIn("$ printf result; exit 3", shown.getvalue())
+        self.assertIn("result", shown.getvalue())
+        self.assertIn("exit code 3", shown.getvalue())
+        self.assertIn("User ran: printf result; exit 3", message)
+        self.assertIn("Command output:\nresult", message)
+        self.assertIn("exit code 3", message)
+
+    def test_bang_command_empty_input_does_not_run_shell(self):
+        with patch.object(lc.subprocess, "run") as run:
+            self.assertEqual(lc.run_bang_command("!  ", tempfile.gettempdir()), "")
+        run.assert_not_called()
+
     def test_export_excludes_internal_context_and_refuses_overwrite(self):
         with tempfile.TemporaryDirectory() as directory:
             agent = lc.Agent("example:7b", lc.Tools(directory))

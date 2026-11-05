@@ -97,6 +97,8 @@ The model picker is searchable too: type part of a name, parameter size, or `nat
 | `/help` | Show commands and keys |
 | `/exit` | Quit |
 
+Enter `!<command>` to run a shell command in the project directory. The command, output, and exit status appear in the chat and are included in the model's context. Output is capped at 24,000 characters and commands stop after 60 seconds.
+
 | Key | |
 | --- | --- |
 | Mouse wheel, PgUp/PgDn, Shift+↑/↓ | Scroll back through the conversation |
