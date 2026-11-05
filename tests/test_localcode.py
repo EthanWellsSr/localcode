@@ -572,7 +572,7 @@ class AutoModeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             env = dict(os.environ, XDG_CONFIG_HOME=directory, NO_COLOR="1")
             result = subprocess.run(
-                [sys.executable, "-c", FAKE_BACKEND, "--plain", "-C", directory],
+                [sys.executable, "-c", FAKE_BACKEND, "--plain", "--no-auto", "-C", directory],
                 input="/auto\n/status\n/yolo\n/auto\n/auto\n/status\n/exit\n",
                 text=True, capture_output=True, env=env, timeout=10)
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -587,6 +587,14 @@ class AutoModeTests(unittest.TestCase):
                 [sys.executable, "-c", FAKE_BACKEND, "--plain", "--auto", "-C", directory],
                 input="/status\n/exit\n", text=True, capture_output=True, env=env, timeout=10)
             self.assertIn("Auto: safe actions approved", result.stdout)
+            result = subprocess.run(
+                [sys.executable, "-c", FAKE_BACKEND, "--plain", "-C", directory],
+                input="/status\n/exit\n", text=True, capture_output=True, env=env, timeout=10)
+            self.assertIn("Auto: safe actions approved", result.stdout)
+            result = subprocess.run(
+                [sys.executable, "-c", FAKE_BACKEND, "--plain", "--no-auto", "-C", directory],
+                input="/status\n/exit\n", text=True, capture_output=True, env=env, timeout=10)
+            self.assertIn("Ask before writes, commands and web fetches", result.stdout)
 
 
 class WebFetchTests(unittest.TestCase):
@@ -1066,11 +1074,11 @@ lc.main()
                 os.write(master, b"hello")
                 time.sleep(0.1)
                 os.write(master, b"\r")
-                wait_for("/ commands")
+                wait_for("/auto to turn off")
                 os.write(master, b"\x12")
                 wait_for("Prompt history")
                 os.write(master, b"\x1b")
-                wait_for("/ commands")
+                wait_for("/auto to turn off")
                 # Selected history is a draft, not an automatic model request.
                 os.write(master, b"\x15/model\r")
                 wait_for("Choose your Ollama model")

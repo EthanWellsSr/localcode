@@ -36,7 +36,7 @@ OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/"
 if not OLLAMA_HOST.startswith("http"):
     OLLAMA_HOST = "http://" + OLLAMA_HOST
 DEFAULT_MODEL = "gpt-oss:20b"
-VERSION = "0.7.0"
+VERSION = "0.7.1"
 NUM_CTX = int(os.environ.get("LOCALCODE_NUM_CTX", "32768"))
 MAX_STEPS = 40
 SHOW_THINKING = os.environ.get("LOCALCODE_SHOW_THINKING") == "1"  # else collapsed to "Thought for Ns"
@@ -2460,8 +2460,11 @@ def main():
     ap.add_argument("prompt", nargs="*", help="run one task and exit")
     ap.add_argument("-m", "--model", help="model to use (default: last one picked, else " + DEFAULT_MODEL + ")")
     ap.add_argument("-C", "--cwd", default=".", help="project directory")
-    ap.add_argument("--auto", action="store_true",
-                    help="approve safe actions (project edits, read-only commands, tests, web fetches); ask about the rest")
+    ap.add_argument("--auto", dest="auto", action="store_true", default=True,
+                    help="approve safe actions; this is the default")
+    ap.add_argument("--no-auto", dest="auto", action="store_false",
+                    help="ask before every write, command, and web fetch")
+    ap.set_defaults(auto=True)
     ap.add_argument("--yolo", action="store_true", help="auto-approve everything, including risky shell commands")
     ap.add_argument("--plain", action="store_true", help="use inline prompts instead of the full-screen interface")
     ap.add_argument("--version", action="version", version="%(prog)s " + VERSION)
