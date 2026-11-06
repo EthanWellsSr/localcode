@@ -603,7 +603,7 @@ TEST_COMMANDS = [c.split() for c in (
     "pytest", "python -m pytest", "python3 -m pytest", "python -m unittest", "python3 -m unittest",
     "python -m py_compile", "python3 -m py_compile", "npm test", "npm run test", "npm run lint", "npm run build",
     "yarn test", "pnpm test", "cargo test", "cargo check", "cargo build", "go test", "go vet", "go build",
-    "make test")]
+    "make test", "sed")]
 
 
 def asked_to_push(request):
