@@ -36,7 +36,7 @@ OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/"
 if not OLLAMA_HOST.startswith("http"):
     OLLAMA_HOST = "http://" + OLLAMA_HOST
 DEFAULT_MODEL = "gpt-oss:20b"
-VERSION = "0.7.2"
+VERSION = "0.7.4"
 NUM_CTX = int(os.environ.get("LOCALCODE_NUM_CTX", "32768"))
 MAX_STEPS = 40
 SHOW_THINKING = os.environ.get("LOCALCODE_SHOW_THINKING") == "1"  # else collapsed to "Thought for Ns"
@@ -737,47 +737,68 @@ class Tools:
             return True
         question = yellow(f"  allow {tool}? ")
         print(question + summary)
-        options = ["[Y]es", "[n]o", "[a]lways for this tool"]
-        cursor = 0
-        try:
-            while True:
-                self._print_options(options, cursor)
-                ch = self._read_input()
-                if not ch:
-                    return False
-                if ch == "\r":
-                    break
-                elif ch == "\x1b[A":
-                    cursor = max(0, cursor - 1)
-                elif ch == "\x1b[B":
-                    cursor = min(len(options) - 1, cursor + 1)
-        except EOFError:
-            return False
-        selected = options[cursor].strip()
-        if selected.lower().startswith("y") or selected.lower().startswith("a"):
+        options = ["Yes", "No", "Always for this tool"]
+        if not sys.stdin.isatty():
+            try:
+                answer = input(yellow("  [Y]es / [n]o / [a]lways: ")).strip().lower()
+            except EOFError:
+                answer = "n"
+            choice = {"": 0, "y": 0, "yes": 0, "a": 2, "always": 2}.get(answer, 1)
+        else:
+            choice = self._choose_option(options)
+        if choice == 2:
             self.always.add(tool)
-            return True
-        return False
+        return choice in (0, 2)
 
-    def _print_options(self, options, cursor):
-        for i, opt in enumerate(options):
-            marker = ">" if i == cursor else " "
-            print(yellow(f"  {marker} {opt}"))
+    def _choose_option(self, options):
+        """Arrow keys + Enter, or y/n/a. Esc, Ctrl-C, Ctrl-D mean no. Redraws in place."""
+        cursor = 0
 
-    def _read_input(self):
-        import sys
-        import tty
+        def draw(first=False):
+            if not first:
+                sys.stdout.write(f"\033[{len(options)}F")  # back to the first option line
+            for i, opt in enumerate(options):
+                line = cyan(f"  ❯ {opt}") if i == cursor else dim(f"    {opt}")
+                sys.stdout.write("\033[2K" + line + "\n")
+            sys.stdout.flush()
+
+        draw(first=True)
+        while True:
+            key = self._read_key()
+            if key in ("\x1b[A", "\x1bOA", "k"):
+                cursor = (cursor - 1) % len(options)
+            elif key in ("\x1b[B", "\x1bOB", "j", "\t"):
+                cursor = (cursor + 1) % len(options)
+            elif key in ("\r", "\n"):
+                return cursor
+            elif key.lower() in ("y", "n", "a"):
+                cursor = "yna".index(key.lower())
+                draw()
+                return cursor
+            elif key in ("", "\x1b", "\x03", "\x04"):
+                cursor = 1
+                draw()
+                return cursor
+            draw()
+
+    def _read_key(self):
+        """Read one keypress in raw mode, including a whole escape sequence."""
+        import select
         import termios
+        import tty
         fd = sys.stdin.fileno()
-        old_settings = termios.tcgetattr(fd)
+        saved = termios.tcgetattr(fd)
         try:
             tty.setraw(fd)
-            ch = sys.stdin.read(1)
+            data = os.read(fd, 1)
+            if data == b"\x1b":
+                while select.select([fd], [], [], 0.05)[0]:
+                    data += os.read(fd, 16)
+                    if data[-1:].isalpha() or data[-1:] == b"~":
+                        break
         finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-        if not ch:
-            return ""
-        return ch
+            termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+        return data.decode("utf-8", errors="replace")
 
     # each tool returns a string that is fed back to the model
 
