@@ -1,6 +1,6 @@
 # Working on localcode
 
-localcode is a terminal coding agent for local Ollama models. All of it is in `localcode.py`.
+localcode is a terminal coding agent for local Ollama models. The agent is in `localcode.py`; terminal UI helpers and the picker are in `localcode_ui.py`.
 
 ## Workflow
 
@@ -20,3 +20,7 @@ localcode is a terminal coding agent for local Ollama models. All of it is in `l
 - Don't guess intent from wording; give explicit commands/mode for it (e.g., `/plan`, `/auto`).
 - Approval rules that skip asking must be conservative.
 - Error messages must not contradict each other.
+
+## Auto mode
+
+Auto mode is enabled by default. It approves writes and edits inside the project, web fetches, read-only commands, git queries, and test runs, while asking about risky actions.
