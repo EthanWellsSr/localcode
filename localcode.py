@@ -735,20 +735,49 @@ class Tools:
         if self.auto and safe:
             print(dim("  ✓ auto-approved"))
             return True
-        print(yellow(f"  allow {tool}? ") + summary)
+        question = yellow(f"  allow {tool}? ")
+        print(question + summary)
+        options = ["[Y]es", "[n]o", "[a]lways for this tool"]
+        cursor = 0
         try:
-            question = yellow("  [Y]es / [n]o / [a]lways for this tool: ")
-            ask = getattr(sys.stdout, "ask", None)  # full-window mode records the prompt and answer
-            ans = ask(question) if ask else input(prompt(question))
+            while True:
+                self._print_options(options, cursor)
+                ch = self._read_input()
+                if not ch:
+                    return False
+                if ch == "\r":
+                    break
+                elif ch == "\x1b[A":
+                    cursor = max(0, cursor - 1)
+                elif ch == "\x1b[B":
+                    cursor = min(len(options) - 1, cursor + 1)
         except EOFError:
             return False
-        ans = ans.strip().lower()
-        if ans:
-            drop_last_history()  # keep y/n answers out of the up-arrow history
-        if ans in ("a", "always"):
+        selected = options[cursor].strip()
+        if selected.lower().startswith("y") or selected.lower().startswith("a"):
             self.always.add(tool)
             return True
-        return ans in ("y", "yes", "")
+        return False
+
+    def _print_options(self, options, cursor):
+        for i, opt in enumerate(options):
+            marker = ">" if i == cursor else " "
+            print(yellow(f"  {marker} {opt}"))
+
+    def _read_input(self):
+        import sys
+        import tty
+        import termios
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)
+            ch = sys.stdin.read(1)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        if not ch:
+            return ""
+        return ch
 
     # each tool returns a string that is fed back to the model
 
