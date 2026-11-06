@@ -12,9 +12,17 @@ localcode is a terminal coding agent for local Ollama models. The agent is in `l
 
 ## Releasing
 
-- Commit message: imperative subject ending in the version (e.g., `Fix spinner leftovers (v0.6.6)`).
-- Push `main`: `git push origin main`
-- Tag: `git tag -a v0.7.3 -m "localcode v0.7.3: <what changed>"` + `git push origin v0.7.3`
+- Use this sequence for every release tag, including small-model-assisted releases:
+  1. Read `VERSION` in `localcode.py`, `version` in `pyproject.toml`, the top of `CHANGELOG.md`, and the latest Git tags. If the user specifies a version, use it exactly; otherwise choose the next patch version for a fix or minor version for a feature.
+  2. Update `VERSION`, `pyproject.toml`, and a new top entry in `CHANGELOG.md` to the same version. Do not change any existing tag.
+  3. Check that the intended release files are the only changes, and confirm the version values match. Do not add or run unit tests for now.
+  4. Commit the release changes with an imperative subject ending in the version, such as `Fix spinner leftovers (v0.8.1)`.
+  5. Before tagging, check that the tag does not already exist locally or remotely. If it exists, stop; never move, delete, or reuse it.
+  6. Create an annotated tag on the release commit and push the commit and tag:
+     `git tag -a vX.Y.Z -m "localcode vX.Y.Z: <what changed>"`
+     `git push origin main`
+     `git push origin vX.Y.Z`
+  7. Verify `localcode --version`, the package version, the commit, and the pushed tag. Report any check that could not be completed.
 
 ## Design lessons
 

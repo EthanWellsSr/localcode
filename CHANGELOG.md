@@ -2,6 +2,11 @@
 
 Each version is a git tag. `localcode --version`, the header and `/status` show the version you're running.
 
+## v0.8.0 — 2026-11-06
+
+- Move terminal rendering, output helpers and the searchable picker into `localcode_ui.py`.
+- Repeat requested lines when the model rereads an unchanged file.
+
 ## v0.7.5 — 2026-11-06
 
 - Repeated reads of unchanged files return the requested lines again, instead of telling the model to reuse an earlier response.
