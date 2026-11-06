@@ -142,10 +142,6 @@ The default is `gpt-oss:20b` (`ollama pull gpt-oss:20b`). It's a mixture-of-expe
 
 ## Development
 
-No runtime dependencies are needed. Run the regression suite with:
-
-```bash
-python3 -m unittest discover -s tests -v
-```
+No runtime dependencies are needed.
 
 The suite uses simulated Ollama responses and a real POSIX pseudo-terminal to check commands, pasted multi-line Unicode text, scrollback, resizing, and terminal restoration. It runs without Ollama or downloaded models. Live model performance and macOS terminal appearance should still be checked on your Mac.

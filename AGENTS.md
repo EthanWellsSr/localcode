@@ -13,7 +13,7 @@ localcode is a terminal coding agent for local Ollama models. All of it is in `l
 
 - Commit message: imperative subject ending in the version (e.g., `Fix spinner leftovers (v0.6.6)`).
 - Push `main`: `git push origin main`
-- Tag: `git tag -a v0.6.6 -m "localcode v0.6.6: <what changed>"` + `git push origin v0.6.6`
+- Tag: `git tag -a v0.7.3 -m "localcode v0.7.3: <what changed>"` + `git push origin v0.7.3`
 
 ## Design lessons
 
