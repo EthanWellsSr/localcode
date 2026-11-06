@@ -34,7 +34,9 @@ localcode --version
 
 ## Tools the model gets
 
-`read_file`, `read_files` (several files in one call), `write_file`, `edit_file`, `list_dir`, `glob`, `grep`, `bash`, `web_fetch`.
+`read_file`, `read_files` (several files in one call), `write_file`, `edit_file`, `list_dir`, `glob`, `search`, `diff`, `bash`, `web_fetch`.
+
+Use `search` to find text or regex matches in project files. Use `diff` to inspect Git status and tracked changes compared with `HEAD`; it lists untracked files for follow-up with `read_file`.
 
 `web_fetch` loads an http or https page and gives the model its readable text: scripts, styles and menus are dropped, and only the page's main content is kept when it marks one. Headings, lists, links and code blocks come through as Markdown. JSON and plain text pass through unchanged, and long pages come in parts. It only fetches pages; it can't search the web. On macOS it uses the system's root certificates if your Python install doesn't have its own.
 

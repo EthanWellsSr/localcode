@@ -2,6 +2,11 @@
 
 Each version is a git tag. `localcode --version`, the header and `/status` show the version you're running.
 
+## v0.9.0 — 2026-11-06
+
+- Add `search` for project text search and `diff` for Git status and tracked changes.
+- Guide models to use the available search and diff tools directly.
+
 ## v0.8.0 — 2026-11-06
 
 - Move terminal rendering, output helpers and the searchable picker into `localcode_ui.py`.
