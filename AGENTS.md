@@ -6,6 +6,7 @@ localcode is a terminal coding agent for local Ollama models. The agent is in `l
 
 - Python 3.9+, standard library only. No dependencies.
 - Read the relevant code before changing it.
+- Do not add or run unit tests for now. The user explicitly wants to defer unit testing because it bogs down local models.
 - For anything bigger than a one-line fix, or anything unclear, tell me what you understood and what you plan to change, then wait for my go-ahead.
 - Keep changes small and focused on what was asked.
 
