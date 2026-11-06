@@ -36,7 +36,7 @@ OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/"
 if not OLLAMA_HOST.startswith("http"):
     OLLAMA_HOST = "http://" + OLLAMA_HOST
 DEFAULT_MODEL = "gpt-oss:20b"
-VERSION = "0.7.4"
+VERSION = "0.7.5"
 NUM_CTX = int(os.environ.get("LOCALCODE_NUM_CTX", "32768"))
 MAX_STEPS = 40
 SHOW_THINKING = os.environ.get("LOCALCODE_SHOW_THINKING") == "1"  # else collapsed to "Thought for Ns"
@@ -818,10 +818,8 @@ class Tools:
         if offset > len(lines):
             return f"Error: offset {offset} is past the end ({len(lines)} lines)"
         stop = len(lines) if not limit else min(len(lines), offset - 1 + int(limit))
-        seen_mtime, seen_end, seen_stop = self.seen.get((p, offset), (None, 0, 0))
-        if seen_mtime == mtime and seen_stop >= stop:  # an earlier read already asked for at least this much
-            return (f"You already read lines {offset}-{seen_end} of {self.rel(p)} earlier in this conversation "
-                    "and the file hasn't changed since. Use that output instead of reading it again.")
+        seen_mtime, _, seen_stop = self.seen.get((p, offset), (None, 0, 0))
+        repeated = seen_mtime == mtime and seen_stop >= stop
         # Fill up to the character budget on whole lines, so results are never cut mid-line.
         out, used, end = [], 0, offset - 1
         for i in range(offset - 1, stop):
@@ -831,11 +829,14 @@ class Tools:
             out.append(row)
             used += len(row) + 1
             end = i + 1
-        self.seen[(p, offset)] = (mtime, end, stop)
         text = "\n".join(out)
         if end < len(lines):
             text += (f"\n... showing lines {offset}-{end} of {len(lines)}. "
                      f"Call read_file with offset={end + 1} to continue.")
+        if repeated:
+            text = (f"File unchanged since your earlier read; repeating lines {offset}-{end} of "
+                    f"{self.rel(p)}:\n{text}")
+        self.seen[(p, offset)] = (mtime, end, stop)
         return text
 
     def read_files(self, paths):

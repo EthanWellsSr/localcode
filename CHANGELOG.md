@@ -2,6 +2,10 @@
 
 Each version is a git tag. `localcode --version`, the header and `/status` show the version you're running.
 
+## v0.7.5 — 2026-11-06
+
+- Repeated reads of unchanged files return the requested lines again, instead of telling the model to reuse an earlier response.
+
 ## v0.7.1 — 2026-11-05
 
 - Auto mode is now enabled by default. Use `--no-auto` to start with approval required for all writes, commands, and web fetches.

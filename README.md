@@ -38,7 +38,7 @@ localcode --version
 
 `web_fetch` loads an http or https page and gives the model its readable text: scripts, styles and menus are dropped, and only the page's main content is kept when it marks one. Headings, lists, links and code blocks come through as Markdown. JSON and plain text pass through unchanged, and long pages come in parts. It only fetches pages; it can't search the web. On macOS it uses the system's root certificates if your Python install doesn't have its own.
 
-Long files are returned in pages with the exact `offset` to read next. Re-reading the same lines of an unchanged file gets a short "you already have this" reply instead of the full text again. Asking for more lines, or reading again after a failed edit, returns the text.
+Long files are returned in pages with the exact `offset` to read next. If the model repeats a read on an unchanged file, localcode returns the requested lines again so the model can use them directly. Asking for more lines, or reading again after a failed edit, returns the text.
 
 Writes, edits, shell commands and web fetches show a diff, the command or the URL and ask before running: `[Y]es / [n]o / [a]lways for this tool`. Enter accepts; `a` remembers that tool for the current session. The status line shows the approval mode; `/status` also lists tools you've allowed for the session.
 
