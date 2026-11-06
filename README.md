@@ -1,6 +1,6 @@
 # localcode
 
-A terminal coding agent built around local [Ollama](https://ollama.com) models. One Python file, standard library only.
+A terminal coding agent built around local [Ollama](https://ollama.com) models. Python 3.9+ and the standard library only.
 
 ![An illustrative localcode session rendered from the terminal interface, showing the multiline composer and session status](docs/terminal-preview.svg)
 
